@@ -83,9 +83,38 @@ python3 cnki_detail.py URL --download --caj --dest papers_cn/    # CAJ when ther
    image; ddddocr detects character boxes and reads each; characters OCR misses are
    assigned by a vision model through the relay (default DeepSeek-V4.1-Flash, override
    with `CNKI_VISION_MODEL`); then clicks the centres in order with jitter.
-3. Up to 3 attempts. If they fail: macOS notification, and the script waits up to
+   **Retry ladder:** each failed attempt issues a fresh captcha, so `solve` makes up
+   to 5 OCR-only attempts before spending one vision call. A failure costs ~2 s and a
+   new image; the vision model costs 10 s+, so the ladder is the cheap path. The
+   streak resets when a captcha passes.
+   **Find the right tab first:** the captcha usually opens in its own `/verify/home`
+   tab, not in the article tab. `solve` searches the other tabs and clicks with the
+   *owning* page's mouse — clicking through the original page handle silently does
+   nothing (this cost an hour of false debugging on 2026-11-01).
+3. If the ladder fails: macOS notification, and the script waits up to
    5 minutes for the user to solve it in the dedicated window, then continues.
    Still unsolved → exit 5.
+
+**Slider (`solve_slider`, added 2026-11-01).** When the click-word path declines,
+`handle_captcha` also tries the Tencent slider: it pulls the background and the
+piece out of the widget's CSS/canvas as data URLs, trims the piece by its alpha
+channel, matches it into the background with `cv2.matchTemplate` (masked), then
+drags the handle along an ease-out path with overshoot and jitter. It logs
+`slider drag dx=… match=…`. It gives up (returns False → human) when the widget
+exposes only one image, when matching scores below 0.35, or when the background
+looks segmented — Tencent shuffles the background into strips in some variants,
+and no amount of template matching fixes that.
+
+Pacing is an environment variable: `CNKI_PAUSE="0.8,1.8"` for the min/max seconds
+between result pages (default `2.0,4.5`). Faster is riskier — CNKI answers bursts
+with a captcha on every page, which looks like progress but is not.
+
+By default a captcha that survives the ladder is **not** waited on: `handle_captcha`
+raises, `cnki_detail.py` records the row as `error: captcha` in the output JSONL and
+in a `.skipped.txt` beside `--out`, then moves to the next article — a failed captcha
+costs one article, not five minutes. Rerun the same command later and the skipped
+articles are retried (files already present are skipped, so nothing is downloaded
+twice). Set `CNKI_CAPTCHA_WAIT=300` to restore the old wait-for-the-human behaviour.
 
 Offline test on a real captcha (2026-10-31): ddddocr read 呢 and 小, missed 场;
 the vision model placed 场 correctly; click order correct. Not yet exercised on a
@@ -144,3 +173,49 @@ shared tables it is not meant to touch.
 - Captcha API (from `/verify/js/342.*.js`): `POST /verify-api/get`, `POST /verify-api/web/check`;
   clickWord returns `wordList`, `originalImageBase64`, `token`, `secretKey`; points are AES-ECB
   encrypted with `secretKey`. The scripts click in the page rather than call the API.
+
+## Batch search, merge, and download selection
+
+Three helpers for "survey a field" work — dozens of queries, then one table:
+
+```bash
+# 1) batch: one JSONL per query, resumable, index.json records what ran
+python3 cnki_batch.py queries.tsv --out-dir search/
+python3 cnki_batch.py queries.tsv --out-dir search/ --only A,B
+
+# 2) merge: dedupe by title (keeps the higher-cited copy), mark core journals,
+#    print per-group counts, write the table and an optional stats JSON
+python3 cnki_table.py search/ --out lit_records.csv --stats stats.json --top 5
+python3 cnki_table.py search/ --out lit_records.csv --names labels.tsv
+
+# 3) pick what to download, then fetch details + PDFs
+python3 select_download.py lit_records.csv --out selected.jsonl --per-group 3
+python3 cnki_detail.py --from selected.jsonl --download --dest papers_cn/
+```
+
+`queries.tsv` (tab-separated, header required):
+
+| label | query | field | db | sort | pages | name |
+|---|---|---|---|---|---|---|
+| A | 法律的经济分析 | SU | JOURNAL | CF,PT | 2 | 法经济学基础理论 |
+
+- `label` groups rows into a theme; `name` is the human-readable group title.
+- `sort` takes a comma list — `CF,PT` runs the same query under both citation and recency
+  sorting, which is what you want for a field survey: skipping one silently biases the sample.
+- Blank field/db/sort/pages fall back to `SU`/`JOURNAL`/`FFD`/`1`.
+
+Behaviour worth knowing:
+- `cnki_batch.py` skips a query only when its JSONL exists **and is non-empty**, so a killed run
+  resumes; it exits non-zero when every query failed, so a broken path or expired login is loud.
+- `cnki_table.py` keeps the first group as 分组 and only counts the others in the stats, so
+  cross-listed papers do not fragment the table. Pass `--names labels.tsv` when the JSONL came
+  from an older run that has no `index.json`.
+- CNKI's result page no longer exposes CSSCI/北大核心 badges (`marks` only carries 网络首发 and
+  similar), so core-journal marking uses a built-in whitelist of law and economics journals.
+  Extend `CORE` in `cnki_table.py` when the field moves.
+
+Measured on 2026-11-01: 112 queries (28 terms × CF/PT × 2 pages) in ~22 minutes,
+3,438 unique records; a 56-query first pass over the same field had produced 1,561.
+Treat the output as a sample — the top 40 by citation plus the top 40 by date per
+term, not the field. Say so in any report built from it, and use `cnki_detail.py`
+citation chasing for the handful of papers whose reference lists matter.

@@ -140,35 +140,54 @@ def main():
     urls = list(a.urls)
     if a.src:
         rows = [json.loads(l) for l in open(a.src, encoding="utf-8") if l.strip()]
-        urls += [r["url"] for r in (rows[: a.top] if a.top else rows)]
+        picked = rows[: a.top] if a.top else rows
+        bad = [r for r in picked if not str(r.get("url", "")).startswith("http")]
+        if bad:
+            print(f"skip      {len(bad)} row(s) without a valid url", file=sys.stderr)
+        urls += [r["url"] for r in picked if str(r.get("url", "")).startswith("http")]
     if not urls:
         ap.error("give URLs or --from")
     dest = pathlib.Path(a.dest).expanduser()
-    out_lines, n_ok, n_new = [], 0, 0
+    out_lines, n_ok, n_new, skipped = [], 0, 0, []
     with C.attached() as (ctx, pg):
         for i, url in enumerate(urls):
             if i:
                 time.sleep(random.uniform(*C.PAUSE))
-            pg.goto(url, wait_until="domcontentloaded")
-            time.sleep(2)
-            C.handle_captcha(pg)
-            info = pg.evaluate(DETAIL_JS)
-            if not info["title"]:
-                info = {"url": url, "error": "no title on page"}
-            else:
-                info["url"] = url
-                if a.download and n_new >= a.max_downloads:
-                    info["download"] = {"status": "skipped-cap", "error": f"--max-downloads {a.max_downloads} reached"}
-                elif a.download:
-                    info["download"] = download(ctx, pg, dest, info, caj=a.caj, browser=ctx.browser)
-                    n_ok += info["download"].get("status") in ("ok", "exists")
-                    n_new += info["download"].get("status") == "ok"
+            try:
+                pg.goto(url, wait_until="domcontentloaded")
+                time.sleep(2)
+                C.handle_captcha(pg)
+                info = pg.evaluate(DETAIL_JS)
+                if not info["title"]:
+                    info = {"url": url, "error": "no title on page"}
+                else:
+                    info["url"] = url
+                    if a.download and n_new >= a.max_downloads:
+                        info["download"] = {"status": "skipped-cap",
+                                            "error": f"--max-downloads {a.max_downloads} reached"}
+                    elif a.download:
+                        info["download"] = download(ctx, pg, dest, info, caj=a.caj, browser=ctx.browser)
+                        n_ok += info["download"].get("status") in ("ok", "exists")
+                        n_new += info["download"].get("status") == "ok"
+            except C.SkillError as e:
+                info = {"url": url, "error": f"captcha: {e}"}
+                skipped.append(url)
+                print(f"{i + 1}. 跳过（验证码没过去，回头再补）", file=sys.stderr)
+            except Exception as e:
+                info = {"url": url, "error": f"{type(e).__name__}: {e}"}
+                skipped.append(url)
+                print(f"{i + 1}. 跳过（{type(e).__name__}: {str(e)[:60]}）", file=sys.stderr)
             out_lines.append(json.dumps(info, ensure_ascii=False))
             d = info.get("download", {})
-            print(f"{i + 1}. {info.get('title', url)[:40]} | 摘要{len(info.get('abstract', ''))}字"
-                  + (f" | 下载 {d.get('status')} {pathlib.Path(d['file']).name if d.get('file') else d.get('error', '')}" if d else ""))
+            if info.get("title"):
+                print(f"{i + 1}. {info.get('title', url)[:40]} | 摘要{len(info.get('abstract', ''))}字"
+                      + (f" | 下载 {d.get('status')} {pathlib.Path(d['file']).name if d.get('file') else d.get('error', '')}" if d else ""))
     if a.out:
         pathlib.Path(a.out).write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+        if skipped:
+            skip_path = pathlib.Path(a.out).with_suffix(".skipped.txt")
+            skip_path.write_text("\n".join(skipped) + "\n", encoding="utf-8")
+            print(f"跳过 {len(skipped)} 篇，待补名单 {skip_path}", file=sys.stderr)
     if a.download:
         print(f"downloaded {n_ok}/{len(urls)} -> {dest}")
     return C.EXIT_OK

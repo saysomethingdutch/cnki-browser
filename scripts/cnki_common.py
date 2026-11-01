@@ -5,7 +5,7 @@ STATE = pathlib.Path.home() / ".agents/state/cnki-browser"
 OUT_DIR = STATE / "out"
 PORT = int(os.environ.get("CNKI_CDP_PORT", "9334"))
 ADV_URL = "https://kns.cnki.net/kns8s/AdvSearch"
-PAUSE = (2.0, 4.5)
+PAUSE = tuple(float(x) for x in os.environ.get("CNKI_PAUSE", "2.0,4.5").split(","))
 
 EXIT_OK, EXIT_ERR, EXIT_LOGIN, EXIT_BROWSER, EXIT_CAPTCHA, EXIT_LAYOUT = 0, 1, 3, 4, 5, 6
 
@@ -67,8 +67,14 @@ def handle_captcha(pg, wait_s=300):
         return False
     try:
         import cnki_captcha
-        for attempt in range(3):
-            if cnki_captcha.solve(pg):
+        for attempt in range(1):  # solve() 内部已做 5 次 OCR + 1 次视觉的阶梯
+            solved = False
+            for fn in ("solve", "solve_slider"):
+                f = getattr(cnki_captcha, fn, None)
+                if f and f(pg):
+                    solved = True
+                    break
+            if solved:
                 time.sleep(2)
                 if not captcha_visible(pg):
                     print(f"captcha  auto-solved (attempt {attempt + 1})", file=sys.stderr)
@@ -77,6 +83,11 @@ def handle_captcha(pg, wait_s=300):
         pass
     except Exception as e:
         print(f"captcha  auto-solver error: {e}", file=sys.stderr)
+    wait_s = int(os.environ.get("CNKI_CAPTCHA_WAIT", "0") or 0)
+    if wait_s <= 0:
+        # 默认不干等：这一篇跳过，调用方继续下一篇，回头补
+        print("captcha  自动过不了，跳过这一篇，稍后重试", file=sys.stderr)
+        raise SkillError("captcha skipped", EXIT_CAPTCHA)
     notify("知网弹出验证码，请在专用 Chrome 窗口里完成")
     print("captcha  waiting for the user to solve it in the CNKI Chrome window ...", file=sys.stderr)
     deadline = time.time() + wait_s
