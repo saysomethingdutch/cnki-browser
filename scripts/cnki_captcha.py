@@ -113,7 +113,10 @@ def plan_clicks(png, chars, decoy_vision=False):
 
 def _verify_page(pg):
     """验证码可能开在另一个 /verify/home 标签页里，先把页面找准。"""
-    info = pg.evaluate(FIND_JS)
+    try:
+        info = pg.evaluate(FIND_JS)
+    except Exception:
+        info = None
     if info and info.get("msg"):
         return pg, info
     try:
@@ -178,3 +181,144 @@ def solve(pg):
         _FAIL_STREAK += 1
         time.sleep(random.uniform(0.5, 1.0))
     return False
+
+
+# ---------------------------------------------------------------------------
+# Slider ("向右滑动完成验证", captchaType=blockPuzzle)
+#
+# CNKI's own VerifySlide component (verify/js/342.*.js) works like this:
+#   - background <img> 310x155 and a piece <img> 47x155 (PNG with alpha) inside
+#     .verify-sub-block, which moves with the handle .verify-move-block;
+#   - mousedown on the handle, mousemove on window, mouseup on window;
+#   - on mouseup it sends x = 310 * moveBlockLeft / imgWidth to /verify-api/web/check.
+# So the piece's x on the background equals the handle's travel in page pixels,
+# scaled by imgWidth/310.
+# ---------------------------------------------------------------------------
+
+SLIDER_JS = r"""() => {
+  const bg = [...document.querySelectorAll('.verify-img-panel img')].find(i => (i.src||'').startsWith('data:image'));
+  const pc = document.querySelector('.verify-sub-block img');
+  const h = document.querySelector('.verify-move-block');
+  if (!bg || !pc || !h) return null;
+  const rb = bg.getBoundingClientRect(), rh = h.getBoundingClientRect();
+  if (rb.width < 100 || rh.width < 10 || rb.top < -1000) return null;
+  return {bg: bg.src, piece: pc.src, bgx: rb.left, bgw: rb.width, nw: bg.naturalWidth,
+          hx: rh.left + rh.width / 2, hy: rh.top + rh.height / 2};
+}"""
+
+SLIDER_MIN_SCORE = 0.28
+
+
+def slider_offset(bg_png, piece_png):
+    """Return (x, score): where the piece's left edge belongs on the background, in natural pixels."""
+    import numpy as np, cv2
+    bg = cv2.imdecode(np.frombuffer(bg_png, np.uint8), cv2.IMREAD_COLOR)
+    pc = cv2.imdecode(np.frombuffer(piece_png, np.uint8), cv2.IMREAD_UNCHANGED)
+    if bg is None or pc is None or pc.ndim != 3 or pc.shape[2] != 4:
+        return None, 0.0
+    alpha = pc[:, :, 3]
+    ys, xs = np.where(alpha > 0)
+    if not len(ys):
+        return None, 0.0
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    mask = (alpha[y0:y1, x0:x1] > 0).astype(np.uint8) * 255
+    outline = cv2.morphologyEx(mask, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))
+    band = bg[max(0, y0 - 3):y1 + 3]
+    edges = cv2.Canny(cv2.cvtColor(band, cv2.COLOR_BGR2GRAY), 60, 180)
+    if edges.shape[0] < outline.shape[0] or edges.shape[1] < outline.shape[1]:
+        return None, 0.0
+    res = cv2.matchTemplate(edges, outline, cv2.TM_CCORR_NORMED)
+    # the piece starts at x=0 and always overlaps its own spot there; skip the first piece-width
+    res[:, : max(1, x1 - x0)] = 0
+    _, score, _, loc = cv2.minMaxLoc(res)
+    return int(loc[0] - x0), float(score)
+
+
+def _drag_path(dx):
+    """Ease-out path with a small overshoot and settle, like a hand."""
+    pts, n = [], random.randint(22, 32)
+    over = dx + random.uniform(2, 5)
+    for i in range(1, n + 1):
+        f = 1 - (1 - i / n) ** 3
+        pts.append((over * f, random.uniform(-1.2, 1.2)))
+    for k in range(random.randint(3, 5)):
+        pts.append((over - (over - dx) * (k + 1) / 4, random.uniform(-0.6, 0.6)))
+    pts.append((dx, 0))
+    return pts
+
+
+def _slider_page(pg):
+    try:
+        info = pg.evaluate(SLIDER_JS)
+    except Exception:
+        info = None
+    if info:
+        return pg, info
+    try:
+        pages = pg.context.pages
+    except Exception:
+        return pg, None
+    for p in pages:
+        try:
+            if p is pg or "/verify/" not in (p.url or ""):
+                continue
+            i2 = p.evaluate(SLIDER_JS)
+            if i2:
+                return p, i2
+        except Exception:
+            continue
+    return pg, None
+
+
+def solve_slider(pg, attempts=4):
+    """Solve CNKI's blockPuzzle slider. Returns True when the verify page goes away."""
+    for i in range(attempts):
+        page, info = _slider_page(pg)
+        if not info:
+            return bool(i)
+        bg = base64.b64decode(info["bg"].split(",", 1)[1])
+        pc = base64.b64decode(info["piece"].split(",", 1)[1])
+        x, score = slider_offset(bg, pc)
+        print(f"captcha  slider match x={x} score={score:.3f}", file=sys.stderr)
+        if x is None or score < SLIDER_MIN_SCORE:
+            return False
+        dx = x * info["bgw"] / info["nw"]
+        page.mouse.move(info["hx"], info["hy"], steps=random.randint(6, 12))
+        time.sleep(random.uniform(0.2, 0.45))
+        page.mouse.down()
+        for px, py in _drag_path(dx):
+            page.mouse.move(info["hx"] + px, info["hy"] + py)
+            time.sleep(random.uniform(0.012, 0.03))
+        time.sleep(random.uniform(0.15, 0.35))
+        page.mouse.up()
+        verdict = _slider_verdict(page)
+        if verdict == "pass":
+            print("captcha  slider passed", file=sys.stderr)
+            time.sleep(1.5)
+            return True
+        print(f"captcha  slider attempt {i + 1}: {verdict}, new image", file=sys.stderr)
+        time.sleep(random.uniform(1.2, 1.8))
+    return False
+
+
+def _slider_verdict(page, timeout=4.0):
+    """Read the widget's own result: icon-check / 验证成功 = pass, icon-close / 验证失败 = fail.
+    The page navigates away ~1 s after a pass, so a vanished widget also counts as a pass."""
+    js = """() => { const i = document.querySelector('.verify-move-block i');
+                     const t = document.querySelector('.verify-tips');
+                     return {icon: i ? i.className : '', tip: t ? t.innerText : '',
+                             here: !!document.querySelector('.verify-move-block')}; }"""
+    end = time.time() + timeout
+    while time.time() < end:
+        time.sleep(0.2)
+        try:
+            s = page.evaluate(js)
+        except Exception:
+            return "pass"
+        if "icon-check" in s["icon"] or "成功" in s["tip"]:
+            return "pass"
+        if "icon-close" in s["icon"] or "失败" in s["tip"]:
+            return "fail"
+        if not s["here"]:
+            return "pass"
+    return "no-verdict"

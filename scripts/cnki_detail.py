@@ -150,14 +150,42 @@ def main():
     dest = pathlib.Path(a.dest).expanduser()
     out_lines, n_ok, n_new, skipped = [], 0, 0, []
     with C.attached() as (ctx, pg):
+        # 清掉上次残留的标签页（专用 profile，都是本脚本开的）
+        for extra in list(ctx.pages):
+            if extra is not pg:
+                try:
+                    extra.close()
+                except Exception:
+                    pass
+        def live_page():
+            """CNKI 弹验证码时会新开标签并关掉原页，手里的句柄会失效，每轮重新取一个。"""
+            nonlocal pg
+            if not pg.is_closed():
+                return pg
+            for cand in ctx.pages:
+                if not cand.is_closed() and "/verify/" not in (cand.url or ""):
+                    pg = cand
+                    return pg
+            pg = ctx.pages[0] if ctx.pages else ctx.new_page()
+            return pg
+
         for i, url in enumerate(urls):
+            page = live_page()
+            for stale in list(ctx.pages):
+                if stale is not page and not stale.is_closed() and "/verify/" in (stale.url or ""):
+                    try:
+                        stale.close()
+                    except Exception:
+                        pass
             if i:
                 time.sleep(random.uniform(*C.PAUSE))
             try:
-                pg.goto(url, wait_until="domcontentloaded")
+                page.goto(url, wait_until="domcontentloaded")
                 time.sleep(2)
-                C.handle_captcha(pg)
-                info = pg.evaluate(DETAIL_JS)
+                page = pg if not pg.is_closed() else live_page()
+                C.handle_captcha(page)
+                page = pg if not pg.is_closed() else live_page()
+                info = page.evaluate(DETAIL_JS)
                 if not info["title"]:
                     info = {"url": url, "error": "no title on page"}
                 else:
@@ -166,7 +194,7 @@ def main():
                         info["download"] = {"status": "skipped-cap",
                                             "error": f"--max-downloads {a.max_downloads} reached"}
                     elif a.download:
-                        info["download"] = download(ctx, pg, dest, info, caj=a.caj, browser=ctx.browser)
+                        info["download"] = download(ctx, page, dest, info, caj=a.caj, browser=ctx.browser)
                         n_ok += info["download"].get("status") in ("ok", "exists")
                         n_new += info["download"].get("status") == "ok"
             except C.SkillError as e:
