@@ -337,3 +337,95 @@ def _slider_verdict(page, timeout=4.0):
         if not s["here"]:
             return "pass"
     return "no-verdict"
+
+
+# ------------------------------------------------- bar.cnki.net 下载闸门（滑块-方框式）
+BAR_FIND_JS = r"""() => {
+  const bg = document.querySelector('.tencent-captcha-dy__verify-bg-img');
+  const hd = document.querySelector('.tencent-captcha-dy__slider-block');
+  if (!bg || !hd) return null;
+  const rb = bg.getBoundingClientRect(), rh = hd.getBoundingClientRect();
+  return {bg: {x: rb.left, y: rb.top, w: rb.width, h: rb.height},
+          hd: {x: rh.left, y: rh.top, w: rh.width, h: rh.height}};
+}"""
+
+
+def _find_boxes(png):
+    """背景里有两个方框：左=拼图起点，右=缺口。返回 (dx_img_px, side, y1, y2) 或 None。"""
+    import cv2, numpy as np
+    im = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
+    if im is None:
+        return None
+    g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+    e = cv2.Canny(g, 40, 120)
+    cnts, _ = cv2.findContours(e, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    H = im.shape[0]
+    cands = []
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        if not (H * 0.10 <= h <= H * 0.5):
+            continue
+        if not (0.70 <= w / max(h, 1) <= 1.40):
+            continue
+        cands.append((x, y, w, h))
+    # 全组合配对：两个方框尺寸相近、纵向对齐、横向有足够间隔；取尺寸差最小的一对
+    best = None
+    for i in range(len(cands)):
+        for j in range(i + 1, len(cands)):
+            a, b = cands[i], cands[j]
+            wa, wb = (a[2] + b[2]) / 2, (a[3] + b[3]) / 2
+            if abs(a[2] - b[2]) > 0.20 * wa or abs(a[3] - b[3]) > 0.25 * wb:
+                continue
+            if abs(a[1] - b[1]) > 0.30 * wb:
+                continue
+            dx = abs(b[0] - a[0])
+            if dx < 1.2 * wa or dx > 0.95 * im.shape[1]:
+                continue
+            score = abs(a[2] - b[2]) + abs(a[3] - b[3]) + abs(a[1] - b[1]) * 0.5
+            if best is None or score < best[0]:
+                left, right = (a, b) if a[0] < b[0] else (b, a)
+                best = (score, right[0] - left[0], left[2], left[1], right[1])
+    if not best:
+        return None
+    return best[1], best[2], best[3], best[4]
+
+
+def solve_slider_bar(pg):
+    """bar.cnki.net 的下载验证：拖动下方滑块完成拼图（两个方框）。"""
+    try:
+        info = pg.evaluate(BAR_FIND_JS)
+    except Exception:
+        return False
+    if not info:
+        return False
+    try:
+        shot = pg.locator(".tencent-captcha-dy__verify-bg-img").first.screenshot(timeout=4000)
+    except Exception:
+        return False
+    found = _find_boxes(shot)
+    if not found:
+        print("slider-bar  没找到两个方框", file=sys.stderr)
+        return False
+    dx_img, side, ya, yb = found
+    from PIL import Image
+    import io as _io
+    iw = Image.open(_io.BytesIO(shot)).width
+    scale = info["bg"]["w"] / max(iw, 1)
+    dx = dx_img * scale
+    h = info["hd"]
+    sx, sy = h["x"] + h["w"] / 2, h["y"] + h["h"] / 2
+    pg.mouse.move(sx, sy)
+    time.sleep(random.uniform(0.12, 0.25))
+    pg.mouse.down()
+    time.sleep(random.uniform(0.08, 0.16))
+    n = 46
+    for i in range(1, n + 1):
+        t = i / n
+        off = dx * (1 - (1 - t) ** 3)
+        pg.mouse.move(sx + off, sy + random.uniform(-0.8, 0.8))
+        time.sleep(random.uniform(0.006, 0.016) if i < 24 else random.uniform(0.012, 0.026))
+    time.sleep(random.uniform(0.15, 0.3))
+    pg.mouse.up()
+    print(f"slider-bar  drag dx={dx:.1f}px (img dx={dx_img}, side={side})", file=sys.stderr)
+    time.sleep(1.8)
+    return True

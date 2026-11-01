@@ -102,7 +102,7 @@ def handle_captcha(pg, wait_s=300):
         rounds = int(os.environ.get("CNKI_CAPTCHA_ROUNDS", "4"))
         for attempt in range(rounds):
             solved = False
-            for fn in ("solve_slider", "solve"):
+            for fn in ("solve_slider_bar", "solve_slider", "solve"):
                 f = getattr(cnki_captcha, fn, None)
                 if f and f(pg):
                     solved = True
