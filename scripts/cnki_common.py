@@ -27,6 +27,22 @@ def run(fn):
         return e.code
 
 
+def ensure_tab():
+    """Chrome can be alive with no window (the last tab was closed). connect_over_cdp then
+    fails with 'Browser context management is not supported', so open a tab first."""
+    import urllib.request
+    try:
+        tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json/list", timeout=2))
+    except Exception:
+        return
+    if any(t.get("type") == "page" for t in tabs):
+        return
+    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/json/new?about:blank", method="PUT")
+    with contextlib.suppress(Exception):
+        urllib.request.urlopen(req, timeout=5)
+        time.sleep(1)
+
+
 @contextlib.contextmanager
 def attached():
     from playwright.sync_api import sync_playwright
@@ -35,6 +51,7 @@ def attached():
         urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json/version", timeout=1.5)
     except Exception:
         raise SkillError(f"dedicated Chrome not running on :{PORT}; run cnki_chrome.py start", EXIT_BROWSER)
+    ensure_tab()
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{PORT}")
         ctx = browser.contexts[0]
@@ -47,6 +64,11 @@ def attached():
 
 
 def captcha_visible(pg):
+    try:
+        if pg.is_closed():
+            return False
+    except Exception:
+        return False
     return pg.evaluate("""(sel) => {
       const e = document.querySelector(sel); if (!e) return false;
       const r = e.getBoundingClientRect(); if (r.width < 20 || r.height < 20) return false;
@@ -56,6 +78,13 @@ def captcha_visible(pg):
       return true; }""", CAPTCHA_SEL) or bool(re.search(r"/verify/", pg.url))
 
 
+def _safe_visible(pg):
+    try:
+        return captcha_visible(pg)
+    except Exception:
+        return False
+
+
 def notify(msg):
     with contextlib.suppress(Exception):
         subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "CNKI 脚本" sound name "Glass"'])
@@ -63,11 +92,11 @@ def notify(msg):
 
 def handle_captcha(pg, wait_s=300):
     """If a captcha is on screen: try the auto solver, else wait for the user to clear it."""
-    if not captcha_visible(pg):
+    if not _safe_visible(pg):
         return False
     try:
         import cnki_captcha
-        for attempt in range(1):  # solve() 内部已做 5 次 OCR + 1 次视觉的阶梯
+        for attempt in range(1):  # solve() 内部自己会换图重试
             solved = False
             for fn in ("solve", "solve_slider"):
                 f = getattr(cnki_captcha, fn, None)
@@ -76,7 +105,7 @@ def handle_captcha(pg, wait_s=300):
                     break
             if solved:
                 time.sleep(2)
-                if not captcha_visible(pg):
+                if not _safe_visible(pg):
                     print(f"captcha  auto-solved (attempt {attempt + 1})", file=sys.stderr)
                     return True
     except ImportError:

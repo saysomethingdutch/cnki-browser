@@ -93,8 +93,9 @@ def main():
         slug = f'{q["label"]}__{i:03d}_{q["sort"]}'
         fname = f"{slug}.jsonl"
         out = (out_dir / fname).resolve()
-        if fname in done and out.exists() and out.stat().st_size > 0:
-            print(f"[skip] {fname}", flush=True)
+        prev = next((e for e in index if e["file"] == fname), None)
+        if out.exists() and (out.stat().st_size > 0 or (prev and prev.get("exit") == 0)):
+            print(f"[skip] {fname}" + ("（上次 0 条）" if out.stat().st_size == 0 else ""), flush=True)
             continue
         cmd = [PY, str(scripts_dir / "cnki_search.py"), q["query"],
                "--field", q["field"], "--db", q["db"], "--sort", q["sort"],

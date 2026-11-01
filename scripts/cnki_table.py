@@ -17,7 +17,7 @@ Exit codes: 0 ok, 2 no JSONL found.
 import argparse, collections, csv, json, pathlib, re, sys
 
 COLS = ["编号", "分组", "作者", "题名", "刊物", "年", "期", "被引", "下载",
-        "核心标注", "摘要", "链接", "检索式"]
+        "核心标注", "其他标记", "摘要", "链接", "检索式"]
 
 # CNKI 新版结果页不返回 CSSCI/北大核心标记，只能按刊物名判断。
 # 名单覆盖法学与经济学的主要 CSSCI 来源刊；以刊物名精确匹配，避免"法学"误伤"法学论坛"。
@@ -33,15 +33,15 @@ CORE = {
 }
 
 
-def core_mark(source, marks):
-    tags = []
-    if str(source or "").strip() in CORE:
-        tags.append("CSSCI/核心")
+def core_mark(source, marks=None):
+    """Only the core-journal whitelist goes here; 网络首发 and similar tags go to 其他标记."""
+    return "CSSCI/核心" if str(source or "").strip() in CORE else ""
+
+
+def other_marks(marks):
     if isinstance(marks, list):
-        tags += [m for m in marks if m and m not in tags]
-    elif marks:
-        tags.append(str(marks))
-    return ";".join(tags)
+        return ";".join(dict.fromkeys(m for m in marks if m))
+    return str(marks or "")
 
 
 def year_of(s):
@@ -101,7 +101,8 @@ def main():
                     "source": r.get("source", ""), "year": year_of(r.get("date")),
                     "cited": int(str(r.get("cited") or 0).strip() or 0),
                     "downloads": r.get("downloads", ""),
-                    "marks": core_mark(r.get("source"), r.get("marks")),
+                    "marks": core_mark(r.get("source")),
+                    "other": other_marks(r.get("marks")),
                     "url": r.get("url", ""), "query": qtext,
                 }
                 order.append(key)
@@ -114,7 +115,8 @@ def main():
                 if int(str(r.get("cited") or 0).strip() or 0) > cur["cited"]:
                     for k in ("authors", "source", "year", "downloads", "url"):
                         cur[k] = r.get(k, cur[k])
-                    cur["marks"] = core_mark(r.get("source"), r.get("marks"))
+                    cur["marks"] = core_mark(r.get("source"))
+                    cur["other"] = other_marks(r.get("marks"))
                     cur["cited"] = int(str(r.get("cited") or 0).strip() or 0)
 
     rows = [merged[k] for k in order]
@@ -136,13 +138,13 @@ def main():
         for i, r in enumerate(rows, 1):
             w.writerow([f"{r['labels'][0]}{i:04d}", label_name.get(r["labels"][0], r["labels"][0]), r["authors"], r["title"],
                         r["source"], r["year"], "缺", r["cited"], r["downloads"],
-                        r["marks"], "", r["url"], r["query"]])
+                        r["marks"], r.get("other", ""), "", r["url"], r["query"]])
 
     stats = collections.OrderedDict()
     for label in dict.fromkeys(sum((r["labels"] for r in rows), [])):
         sub = [r for r in rows if label in r["labels"]]
         recent = [r for r in sub if r["year"].isdigit() and int(r["year"]) >= 2023]
-        core = [r for r in sub if "CSSCI" in r["marks"] or "核心" in r["marks"]]
+        core = [r for r in sub if r["marks"]]
         top = sorted(sub, key=lambda r: -r["cited"])[: a.top]
         name = label_name.get(label, label)
         stats[label] = {"name": name, "unique": len(sub), "recent_2023": len(recent),

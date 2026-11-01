@@ -66,6 +66,29 @@ def wait_results(pg, timeout=25):
     raise C.SkillError("search results did not load", C.EXIT_LAYOUT)
 
 
+def sort_state(pg, code):
+    return pg.evaluate("(c) => { const l = document.querySelector('li#' + c); return l ? l.className : null; }", code)
+
+
+def ensure_sort(pg, code):
+    """CNKI sort buttons toggle (DESC <-> ASC) and the page remembers the last sort,
+    so click until this button is the current one *and* descending."""
+    for _ in range(3):
+        cls = sort_state(pg, code)
+        if cls is None:
+            raise C.SkillError(f"sort button {code} not found", C.EXIT_LAYOUT)
+        parts = cls.split()
+        if "cur" in parts and "DESC" in parts:
+            return
+        pg.locator(f"li#{code}").first.click()
+        for _ in range(20):
+            time.sleep(0.5)
+            if sort_state(pg, code) != cls:
+                break
+        wait_results(pg)
+    raise C.SkillError(f"could not set sort {code} to descending (class={sort_state(pg, code)!r})", C.EXIT_LAYOUT)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("query")
@@ -124,10 +147,8 @@ def main():
                 C.digest({"status": "ok", "query": a.query, "field": FIELD_NAMES[a.field], "db": a.db,
                           "total": 0, "rows": 0, "saved": str(out)})
                 return C.EXIT_OK
-        if a.sort != "FFD":
-            pg.locator(f"li#{a.sort}").first.click()
-            wait_results(pg)
-            total = total_count(pg)
+        ensure_sort(pg, a.sort)
+        total = total_count(pg)
         crit = re.search(r"检索范围：[^\n]+", pg.inner_text("body"))
         criteria = crit.group(0) if crit else ""
         if a.query.split()[0] not in criteria:

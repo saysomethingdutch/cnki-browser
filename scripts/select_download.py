@@ -1,4 +1,4 @@
-#!/opt/homebrew/bin/python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """从合并后的题录表里挑出要下全文的文章，输出 cnki_detail.py 能吃到的 JSONL。
 
@@ -47,7 +47,7 @@ def main():
         for r in by_cited[: a.per_group]:
             take(r)
         recent_core = [r for r in sub
-                       if r["年"].isdigit() and int(r["年"]) >= a.since and r["核心标注"]]
+                       if r["年"].isdigit() and int(r["年"]) >= a.since and "核心" in r.get("核心标注", "")]
         for r in sorted(recent_core, key=lambda r: -int(r["被引"] or 0))[: a.per_group]:
             take(r)
 

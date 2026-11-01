@@ -45,6 +45,9 @@ python3 cnki_search.py "民族团结进步促进法" --field TI --db JOURNAL --s
 - The script checks the page's 检索范围 line contains the query. CNKI's search box
   autocompletes; if the query was replaced, it exits 6 instead of returning wrong results.
 - `--count-only` prints the hit count without collecting rows — use it to compare phrasings cheaply.
+- CNKI's sort buttons toggle (DESC/ASC) and the page remembers the last sort, so `ensure_sort` clicks until the
+  requested button is current and descending. Relevance (`FFD`) is set explicitly too.
+- `doc_type` is always empty on the JOURNAL tab, which has no 数据库 column.
 - Zero results are a normal outcome (exit 0, empty file). The sort bar only exists when there
   are hits, so the script records 0 before trying to sort.
 - Long titles often return 0 under `--field TI`. Use 10–15 distinctive characters, or search the
@@ -149,6 +152,9 @@ shared tables it is not meant to touch.
 | one result page (20 rows) | ~8 s |
 | detail + PDF download | 3–5 s per paper |
 
+Before testing, confirm nothing else is driving port 9334: two runs on one Chrome interrupt each other and
+produce misleading failures.
+
 ## Exit codes
 
 | Code | Meaning | Next step |
@@ -207,6 +213,9 @@ python3 cnki_detail.py --from selected.jsonl --download --dest papers_cn/
 Behaviour worth knowing:
 - `cnki_batch.py` skips a query only when its JSONL exists **and is non-empty**, so a killed run
   resumes; it exits non-zero when every query failed, so a broken path or expired login is loud.
+- A query whose last run exited 0 with 0 rows is also skipped on resume. `--stop-on-captcha` stops the batch on exit 5.
+- `cnki_table.py` writes the core-journal whitelist to 核心标注 and tags such as 网络首发 to 其他标记;
+  `select_download.py` reads only 核心标注.
 - `cnki_table.py` keeps the first group as 分组 and only counts the others in the stats, so
   cross-listed papers do not fragment the table. Pass `--names labels.tsv` when the JSONL came
   from an older run that has no `index.json`.
