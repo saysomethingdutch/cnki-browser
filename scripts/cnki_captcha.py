@@ -1,20 +1,20 @@
-"""Auto-solver for CNKI captchas: click-word ("请依次点击【呢,场,小】") and Tencent slider.
+"""Auto-solvers for CNKI captchas: click-word ("请依次点击【呢,场,小】") and the slider.
 
-Pipeline:
-  1. Find the captcha image (data:image/png;base64 <img> inside the verify widget)
-     and the required characters from its prompt text.
-  2. ddddocr detection gives character boxes; ddddocr OCR reads each box.
-  3. Assign required characters to boxes: exact OCR matches first; leftovers go to
-     the vision model (GLM via the relay) which returns the box index for each char.
-  4. Click the box centres in order with small human-like delays.
+Everything runs locally (ddddocr + OpenCV); no external model is called.
 
-Both solvers return False when they cannot decide, so the caller falls back to the human.
+Click-word: ddddocr detects character boxes; for each required character the OCR model
+scores how likely it is to be in each box (over several rotations), and the best joint
+assignment is clicked in order. When even the best assignment is unlikely, the solver
+refreshes for a new image instead of guessing.
+
+CNKI often gives no verdict on the first correct answer and serves a second captcha;
+that is normal, so the solver keeps going until it passes or the attempt budget runs out.
+
+Both solvers return False when they cannot decide, so the caller falls back.
 """
-import base64, io, json, os, random, re, sys, time, urllib.request
+import base64, io, os, random, re, sys, time
 
 _det = _ocr = None
-RELAY = os.environ.get("CNKI_VISION_URL", "http://127.0.0.1:15721/v1/responses")
-VISION_MODEL = os.environ.get("CNKI_VISION_MODEL", "ccs-modelbest-codex-self-bui/DEEPSEEK_xsicpn")
 
 FIND_JS = r"""() => {
   const imgs = [...document.querySelectorAll('img')].filter(i => (i.src||'').startsWith('data:image') );
@@ -36,77 +36,59 @@ def _models():
     return _det, _ocr
 
 
-def _vision_assign(png, boxes, chars):
-    """Ask the vision model which numbered box holds each required character."""
-    from PIL import Image, ImageDraw
-    im = Image.open(io.BytesIO(png)).convert("RGB")
-    from PIL import ImageFont
-    im = im.resize((im.width * 2, im.height * 2))
-    d = ImageDraw.Draw(im)
-    try:
-        font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 28)
-    except Exception:
-        font = None
-    for i, (x1, y1, x2, y2) in enumerate(boxes):
-        x1, y1, x2, y2 = (v * 2 for v in (x1, y1, x2, y2))
-        d.rectangle((x1, y1, x2, y2), outline=(255, 0, 0), width=3)
-        d.rectangle((x1, y1 - 30, x1 + 26, y1), fill=(255, 0, 0))
-        d.text((x1 + 5, y1 - 31), str(i), fill=(255, 255, 255), font=font)
-    buf = io.BytesIO(); im.save(buf, "PNG")
-    prompt = ("图中每个红框上方的红底白字是它的编号（0 起）。只有部分红框里是要找的字，其余可能是干扰字或图标。请找出下列汉字分别在哪个编号的红框里，"
-              f"汉字可能被旋转或变形：{'、'.join(chars)}。只输出 JSON，例如 {{\"呢\":1,\"场\":0}}，不要其他文字。")
-    body = {"model": VISION_MODEL, "max_output_tokens": 4000, "reasoning": {"effort": "low"}, "stream": False,
-            "input": [{"role": "user", "content": [
-                {"type": "input_text", "text": prompt},
-                {"type": "input_image", "image_url": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()}]}]}
-    req = urllib.request.Request(RELAY, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json", "Authorization": "Bearer PROXY_MANAGED"})
-    d = json.load(urllib.request.urlopen(req, timeout=90))
-    txt = "".join(c.get("text", "") for o in d.get("output", []) if o.get("type") == "message" for c in o.get("content", []))
-    m = re.search(r"\{.*\}", txt, re.S)
-    return {k: int(v) for k, v in json.loads(m.group(0)).items()} if m else {}
+def _char_probs(img):
+    """Per-step probability matrix (steps x charset) from ddddocr for one crop."""
+    import numpy as np
+    r = _ocr.classification(img, probability=True)
+    return np.array([row for step in r["probabilities"] for row in step], dtype=float)
 
 
-def plan_clicks(png, chars, decoy_vision=False):
+def _crop_variants(crop):
+    """The captcha rotates each character up to about ±40°, so score a few rotations too."""
+    out = [crop]
+    for ang in (-40, -25, -12, 12, 25, 40):
+        out.append(crop.rotate(ang, expand=True, fillcolor=(255, 255, 255)))
+    return out
+
+
+MIN_CHAR_SCORE = float(os.environ.get("CNKI_MIN_CHAR_SCORE", "0.05"))
+
+
+def plan_clicks(png, chars):
+    """Assign each required character to a detected box, then return click points in order.
+
+    Instead of reading every box freely (which ddddocr often gets wrong on rotated,
+    coloured characters), ask the classifier how likely *each required character* is in
+    each box, over several rotations, and pick the assignment with the best joint score.
+    Returns None when even the best assignment is too unlikely, so the caller refreshes.
+    """
+    import itertools
+    import numpy as np
+    from PIL import Image
     det, ocr = _models()
     boxes = det.detection(png)
     if len(boxes) < len(chars):
         return None
-    from PIL import Image
-    im = Image.open(io.BytesIO(png))
-    reads = []
-    for b in boxes:
-        c = im.crop(tuple(b)); buf = io.BytesIO(); c.save(buf, "PNG")
-        reads.append(ocr.classification(buf.getvalue()).strip())
-    assign, used = {}, set()
-    for ch in chars:
-        idx = next((i for i, r in enumerate(reads) if r == ch and i not in used), None)
-        if idx is not None:
-            assign[ch] = idx; used.add(idx)
-    missing = [c for c in chars if c not in assign]
-    need_vision = bool(missing) or (decoy_vision and len(boxes) > len(chars))
-    if need_vision:
-        v = {}
-        for _ in range(3):
-            try:
-                v = _vision_assign(png, boxes, chars)
-                if all(c in v for c in missing):
-                    break
-            except Exception:
-                time.sleep(3)
-        if decoy_vision and len(boxes) > len(chars) and all(c in v for c in chars):
-            idxs = [v[c] for c in chars]
-            if len(set(idxs)) == len(idxs) and all(0 <= i < len(boxes) for i in idxs):
-                assign = dict(v)
-                missing = []
-        for ch in missing:
-            idx = v.get(ch)
-            if idx is None or idx in used or not (0 <= idx < len(boxes)):
-                return None
-            assign[ch] = idx; used.add(idx)
+    charset = ocr.get_charset()
+    index = {c: i for i, c in enumerate(charset)}
+    if any(c not in index for c in chars):
+        return None
+    im = Image.open(io.BytesIO(png)).convert("RGB")
+    S = np.zeros((len(chars), len(boxes)))
+    for j, (x1, y1, x2, y2) in enumerate(boxes):
+        crop = im.crop((max(0, x1 - 3), max(0, y1 - 3), x2 + 3, y2 + 3))
+        mats = [_char_probs(v) for v in _crop_variants(crop)]
+        for i, ch in enumerate(chars):
+            S[i, j] = max(float(m[:, index[ch]].max()) for m in mats)
+    best = max(itertools.permutations(range(len(boxes)), len(chars)),
+               key=lambda p: sum(np.log(S[i, p[i]] + 1e-9) for i in range(len(chars))))
+    scores = [S[i, best[i]] for i in range(len(chars))]
+    print("captcha  char scores " + " ".join(f"{c}={s:.2f}" for c, s in zip(chars, scores)), file=sys.stderr)
+    if min(scores) < MIN_CHAR_SCORE:
+        return None
     pts = []
-    for ch in chars:
-        x1, y1, x2, y2 = boxes[assign[ch]]
+    for i in range(len(chars)):
+        x1, y1, x2, y2 = boxes[best[i]]
         pts.append(((x1 + x2) / 2 + random.uniform(-3, 3), (y1 + y2) / 2 + random.uniform(-3, 3)))
     return pts
 
@@ -136,8 +118,7 @@ def _verify_page(pg):
     return pg, None
 
 
-_FAIL_STREAK = 0
-MAX_OCR_ATTEMPTS = 5
+MAX_CLICK_ATTEMPTS = int(os.environ.get("CNKI_CLICK_ATTEMPTS", "8"))
 
 
 def _still_there(page):
@@ -149,37 +130,71 @@ def _still_there(page):
         return False
 
 
+def _click_verdict(page, timeout=4.0):
+    """Read the widget's own result in .verify-msg: 验证成功 / 验证失败.
+    'none' means CNKI answered nothing (common on the first correct try);
+    'gone' means the page navigated away, which is what a pass looks like."""
+    end = time.time() + timeout
+    while time.time() < end:
+        time.sleep(0.2)
+        if not _still_there(page):
+            return "gone"
+        try:
+            msg = page.evaluate("() => [...document.querySelectorAll('.verify-msg')].map(e => e.innerText).join('|')")
+        except Exception:
+            return "gone"
+        if "成功" in msg:
+            return "pass"
+        if "失败" in msg:
+            return "fail"
+    return "none"
+
+
+def _refresh(page):
+    try:
+        page.locator(".verify-refresh").first.click(timeout=3000)
+    except Exception:
+        try:
+            page.reload(wait_until="domcontentloaded")
+        except Exception:
+            pass
+    time.sleep(random.uniform(1.2, 2.0))
+
+
 def solve(pg):
-    """连续 OCR 尝试；连着 MAX_OCR_ATTEMPTS 次过不了，下一次才用视觉模型兜底。"""
-    global _FAIL_STREAK
-    for i in range(MAX_OCR_ATTEMPTS + 1):
+    """Click-word solver. Keeps trying until the verify page goes away or the budget runs out.
+
+    - low-confidence image  -> refresh for a new one (no click, no guess)
+    - 'none' (no verdict)    -> normal for CNKI; the widget usually reloads a fresh
+                                captcha, so just try again
+    - 'fail'                 -> wait for the widget's own refresh, try again
+    """
+    for i in range(MAX_CLICK_ATTEMPTS):
         page, info = _verify_page(pg)
         if not info or not info.get("msg"):
-            return True if i else False
+            return bool(i) and not _still_there(page)
         m = re.search(r"【(.+?)】", info["msg"])
         if not m:
             return False
         chars = [c.strip() for c in re.split(r"[,，、]", m.group(1)) if c.strip()]
         png = base64.b64decode(info["src"].split(",", 1)[1])
-        use_vision = _FAIL_STREAK >= MAX_OCR_ATTEMPTS
-        if use_vision:
-            # 用掉一次视觉兜底后归零，下一张回到 OCR 阶梯，避免从此每张都走慢路径
-            _FAIL_STREAK = 0
-        pts = plan_clicks(png, chars, decoy_vision=use_vision)
-        if pts:
-            sx, sy = info["w"] / info["nw"], info["h"] / info["nh"]
-            for x, y in pts:
-                page.mouse.move(info["x"] + x * sx, info["y"] + y * sy, steps=random.randint(8, 16))
-                time.sleep(random.uniform(0.25, 0.6))
-                page.mouse.click(info["x"] + x * sx, info["y"] + y * sy)
-            time.sleep(1.6)
-            if not _still_there(page):
-                _FAIL_STREAK = 0
-                print("captcha  通过（连续失败 %d 次后）" % i if i else "captcha  通过", file=sys.stderr)
-                return True
-            print(f"captcha  第 {i + 1} 次未通过，换图重试（累计失败 {_FAIL_STREAK + 1}）", file=sys.stderr)
-        _FAIL_STREAK += 1
-        time.sleep(random.uniform(0.5, 1.0))
+        pts = plan_clicks(png, chars)
+        if not pts:
+            print(f"captcha  第 {i + 1} 次：识别把握不够，换一张", file=sys.stderr)
+            _refresh(page)
+            continue
+        sx, sy = info["w"] / info["nw"], info["h"] / info["nh"]
+        for x, y in pts:
+            page.mouse.move(info["x"] + x * sx, info["y"] + y * sy, steps=random.randint(8, 16))
+            time.sleep(random.uniform(0.25, 0.6))
+            page.mouse.click(info["x"] + x * sx, info["y"] + y * sy)
+        verdict = _click_verdict(page)
+        if verdict in ("pass", "gone"):
+            print(f"captcha  通过（第 {i + 1} 次）", file=sys.stderr)
+            time.sleep(1.2)
+            return True
+        print(f"captcha  第 {i + 1} 次：{ {'fail': '验证失败', 'none': '知网未给结果'}.get(verdict, verdict) }，再来", file=sys.stderr)
+        time.sleep(random.uniform(1.0, 1.6))
     return False
 
 
@@ -275,7 +290,7 @@ def solve_slider(pg, attempts=4):
     for i in range(attempts):
         page, info = _slider_page(pg)
         if not info:
-            return bool(i)
+            return False
         bg = base64.b64decode(info["bg"].split(",", 1)[1])
         pc = base64.b64decode(info["piece"].split(",", 1)[1])
         x, score = slider_offset(bg, pc)

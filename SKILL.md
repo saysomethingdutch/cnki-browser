@@ -1,6 +1,6 @@
 ---
 name: cnki-browser
-description: Search and download from 中国知网 (CNKI) by script, not by screenshot. Use when a task needs CNKI search counts, result lists, abstracts, or full-text PDFs — 知网检索、知网下载、查文献热度、补全文. Attaches Playwright to a dedicated logged-in Chrome; reads the result table and detail pages from the DOM; downloads PDFs through Chrome; auto-solves the click-word captcha (ddddocr + vision model) and falls back to the user.
+description: Search and download from 中国知网 (CNKI) by script, not by screenshot. Use when a task needs CNKI search counts, result lists, abstracts, or full-text PDFs — 知网检索、知网下载、查文献热度、补全文. Attaches Playwright to a dedicated logged-in Chrome; reads the result table and detail pages from the DOM; downloads PDFs through Chrome; auto-solves the click-word and slider captchas locally (ddddocr + OpenCV, no external model) and skips the article if that fails.
 ---
 
 # CNKI Browser
@@ -8,7 +8,7 @@ description: Search and download from 中国知网 (CNKI) by script, not by scre
 Read CNKI with scripts, not with eyes. Same pattern as `pkulaw-browser`: a
 dedicated Chrome with a debugging port, logged in once by the user (on campus
 the institution is recognised by IP automatically), then every script attaches
-over CDP. No screenshots, no model in the loop except for the occasional captcha.
+over CDP. No screenshots and no model in the loop, captchas included.
 
 Run with `/opt/homebrew/bin/python3` (system Python 3.9 is too old). Scripts are
 in `scripts/`. State lives in `~/.agents/state/cnki-browser/`.
@@ -82,50 +82,67 @@ python3 cnki_detail.py URL --download --caj --dest papers_cn/    # CAJ when ther
 1. Detects the Tencent widget (`#tCaptchaDyContent`; it sits off-screen at
    y=-1000000 until triggered — visibility is checked by position, not existence)
    and the full-page `/verify/` click-word captcha.
-2. `cnki_captcha.solve`: reads the prompt (`请依次点击【呢,场,小】`) and the base64
-   image; ddddocr detects character boxes and reads each; characters OCR misses are
-   assigned by a vision model through the relay (default DeepSeek-V4.1-Flash, override
-   with `CNKI_VISION_MODEL`); then clicks the centres in order with jitter.
-   **Retry ladder:** each failed attempt issues a fresh captcha, so `solve` makes up
-   to 5 OCR-only attempts before spending one vision call. A failure costs ~2 s and a
-   new image; the vision model costs 10 s+, so the ladder is the cheap path. The
-   streak resets when a captcha passes.
-   **Find the right tab first:** the captcha usually opens in its own `/verify/home`
-   tab, not in the article tab. `solve` searches the other tabs and clicks with the
-   *owning* page's mouse — clicking through the original page handle silently does
-   nothing (this cost an hour of false debugging on 2026-11-01).
-3. If the ladder fails: macOS notification, and the script waits up to
-   5 minutes for the user to solve it in the dedicated window, then continues.
-   Still unsolved → exit 5.
+2. **Click-word** (`cnki_captcha.solve`, `请依次点击【呢,场,小】`). Everything is local:
+   - ddddocr detects character boxes. It does **not** read each box freely — on rotated,
+     coloured characters free reading is wrong more often than right. Instead, for each
+     required character it asks the OCR model how likely that character is in each box
+     (`probability=True`, over rotations of ±12°, ±25°, ±40°) and picks the assignment
+     with the best joint score.
+   - If even the best assignment has a character below `CNKI_MIN_CHAR_SCORE` (default
+     0.05), it clicks the widget's refresh for a new image instead of guessing.
+   - **CNKI often gives no verdict on the first correct answer** and serves a second
+     captcha. That is normal, not a failure; the solver just goes again. Up to
+     `CNKI_CLICK_ATTEMPTS` (default 8) images per captcha.
+   - A pass is read from the widget (`.verify-msg` says 验证成功) or from the page
+     leaving `/verify/` — CNKI redirects to the article (`returnUrl`) about 1 s after a pass.
+     The server answers `6111` for 验证失败.
+   - **Find the right tab first:** the captcha usually opens in its own `/verify/home`
+     tab, not in the article tab. `solve` searches the other tabs and clicks with the
+     *owning* page's mouse — clicking through the original page handle silently does
+     nothing.
+3. **Slider** (`solve_slider`, `向右滑动完成验证`, captchaType `blockPuzzle`). Written from
+   CNKI's own VerifySlide component (`/verify/js/342.*.js`): background `<img>` 310×155,
+   piece `<img>` 47×155 with alpha in `.verify-sub-block`, handle `.verify-move-block`;
+   the check sends `x = 310 × handle travel / imgWidth`. The solver trims the piece by
+   its alpha, matches its outline against Canny edges of the background within the
+   piece's height band (`cv2.matchTemplate`, `TM_CCORR_NORMED`, ignoring the first
+   piece-width), then drags with an ease-out path, small overshoot and jitter. Success
+   is read from the widget (`icon-check` / 验证成功). Below a match score of 0.28 it
+   gives up rather than guess.
+4. If both fail: see "skipped, not waited on" below.
 
-**Slider (`solve_slider`, added 2026-11-01).** When the click-word path declines,
-`handle_captcha` also tries the Tencent slider: it pulls the background and the
-piece out of the widget's CSS/canvas as data URLs, trims the piece by its alpha
-channel, matches it into the background with `cv2.matchTemplate` (masked), then
-drags the handle along an ease-out path with overshoot and jitter. It logs
-`slider drag dx=… match=…`. It gives up (returns False → human) when the widget
-exposes only one image, when matching scores below 0.35, or when the background
-looks segmented — Tencent shuffles the background into strips in some variants,
-and no amount of template matching fixes that.
+**Chained captchas.** CNKI often serves a second captcha right after the first one
+passes — typically a slider followed by a click-word on the same `/verify/` page.
+`handle_captcha` keeps solving whatever is on screen until the page leaves `/verify/`,
+up to `CNKI_CAPTCHA_ROUNDS` (default 4). End-to-end check on 2026-11-01: captchas
+injected before three of six article fetches (one click-word, two slider→click-word
+chains) were all cleared in 13–18 s and all six articles were read.
+
+Measured on live CNKI captchas, 2026-11-01 (verify page opened directly, nothing else
+driving the browser): **click-word 15/15**, 11–19 s each, most passing on the 2nd–6th
+image; **slider 10/10** plus an earlier 5/5, a few seconds each. An earlier version that
+read characters freely and fell back to a vision model was slower (30–110 s) and failed
+most attempts; it was removed.
+
+**Before testing, make sure nothing else is driving port 9334.** On 2026-11-01 a second
+session ran its own captcha tests on the same Chrome at the same time; the two
+interrupted each other and produced 0/10 "failures", closed pages and stuck prompts
+that had nothing to do with the code.
 
 Pacing is an environment variable: `CNKI_PAUSE="0.8,1.8"` for the min/max seconds
 between result pages (default `2.0,4.5`). Faster is riskier — CNKI answers bursts
 with a captcha on every page, which looks like progress but is not.
 
-By default a captcha that survives the ladder is **not** waited on: `handle_captcha`
+By default a captcha the solvers cannot clear is **not** waited on: `handle_captcha`
 raises, `cnki_detail.py` records the row as `error: captcha` in the output JSONL and
 in a `.skipped.txt` beside `--out`, then moves to the next article — a failed captcha
 costs one article, not five minutes. Rerun the same command later and the skipped
 articles are retried (files already present are skipped, so nothing is downloaded
 twice). Set `CNKI_CAPTCHA_WAIT=300` to restore the old wait-for-the-human behaviour.
 
-Offline test on a real captcha (2026-10-31): ddddocr read 呢 and 小, missed 场;
-the vision model placed 场 correctly; click order correct. Not yet exercised on a
-live captcha — the verify page needs a real `ident` from CNKI, so it can't be
-summoned on demand. Vision notes: GLM-5.3 burned its whole token budget on
-reasoning and returned nothing; DeepSeek with `reasoning.effort=low` answered in
-~11 s. Box labels must be large (image scaled 2×, white-on-red numbers) or the
-model misreads them.
+To test the solvers on demand: a verify URL from a real trigger (with its `ident`,
+`captchaId` and `returnUrl`) can be reopened and serves a fresh captcha each time;
+swapping `captchaType=clickWord` for `blockPuzzle` gives the slider.
 
 The user's school network office approved automated captcha solving
 (2026-11-01). CNKI's own terms may still disallow it; keep volumes modest.
@@ -151,9 +168,7 @@ shared tables it is not meant to touch.
 | `--count-only` | ~7 s |
 | one result page (20 rows) | ~8 s |
 | detail + PDF download | 3–5 s per paper |
-
-Before testing, confirm nothing else is driving port 9334: two runs on one Chrome interrupt each other and
-produce misleading failures.
+| captcha, click-word / slider | 11–19 s / a few s |
 
 ## Exit codes
 

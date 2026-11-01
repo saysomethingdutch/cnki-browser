@@ -96,18 +96,24 @@ def handle_captcha(pg, wait_s=300):
         return False
     try:
         import cnki_captcha
-        for attempt in range(1):  # solve() 内部自己会换图重试
+        # CNKI often chains captchas: a passed slider is followed by a click-word on the
+        # same /verify/ page, and a passed click-word can be followed by another. Keep
+        # solving whatever is on screen until the page leaves /verify/, up to a few rounds.
+        rounds = int(os.environ.get("CNKI_CAPTCHA_ROUNDS", "4"))
+        for attempt in range(rounds):
             solved = False
-            for fn in ("solve", "solve_slider"):
+            for fn in ("solve_slider", "solve"):
                 f = getattr(cnki_captcha, fn, None)
                 if f and f(pg):
                     solved = True
                     break
-            if solved:
-                time.sleep(2)
-                if not _safe_visible(pg):
-                    print(f"captcha  auto-solved (attempt {attempt + 1})", file=sys.stderr)
-                    return True
+            if not solved:
+                break
+            time.sleep(2)
+            if not _safe_visible(pg):
+                print(f"captcha  auto-solved ({attempt + 1} round{'s' if attempt else ''})", file=sys.stderr)
+                return True
+            print("captcha  passed one, CNKI served another; solving again", file=sys.stderr)
     except ImportError:
         pass
     except Exception as e:
