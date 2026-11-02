@@ -100,15 +100,30 @@ python3 cnki_detail.py URL --download --caj --dest papers_cn/    # CAJ when ther
      tab, not in the article tab. `solve` searches the other tabs and clicks with the
      *owning* page's mouse — clicking through the original page handle silently does
      nothing.
-3. **Slider** (`solve_slider`, `向右滑动完成验证`, captchaType `blockPuzzle`). Written from
-   CNKI's own VerifySlide component (`/verify/js/342.*.js`): background `<img>` 310×155,
-   piece `<img>` 47×155 with alpha in `.verify-sub-block`, handle `.verify-move-block`;
-   the check sends `x = 310 × handle travel / imgWidth`. The solver trims the piece by
-   its alpha, matches its outline against Canny edges of the background within the
-   piece's height band (`cv2.matchTemplate`, `TM_CCORR_NORMED`, ignoring the first
-   piece-width), then drags with an ease-out path, small overshoot and jitter. Success
-   is read from the widget (`icon-check` / 验证成功). Below a match score of 0.28 it
-   gives up rather than guess.
+3. **Slider — one adaptive solver for every variant** (`solve_slider`). CNKI uses at least two
+   slider widgets with unrelated DOM: kns `/verify/home?captchaType=blockPuzzle`
+   (`.verify-sub-block`…) and the **download gate** `bar.cnki.net/bar/verify/…` that appears
+   when clicking PDF download (Tencent `.tencent-captcha-dy__…`). Writing one solver per
+   widget is what broke downloads before (101/101 skipped), so the solver knows no class names:
+   - **parts by structure:** background = largest image-bearing element 200 px+ wide (but not
+     page-sized); piece = image-bearing element inside it, 8–45 % of its width, at the left;
+     handle = small pointer-cursor element below it. Each background candidate is tried in
+     turn until one has a piece and a handle.
+   - **piece shape:** screenshot the background with the piece shown and hidden; the
+     difference is the piece's exact silhouette.
+   - **gap, two cues:** *shade* (ring vs inside contrast of that silhouette, strong on the
+     download gate) and *edge* (silhouette outline vs Canny edges, strong on kns, where decoy
+     outlines exist). Each cue gets a confidence = best / best elsewhere. Drag only when the
+     cues agree (and one is ≥ 1.5) or a single cue is ≥ `CNKI_SLIDER_MIN_CONF` (2.7);
+     otherwise refresh for a new image. Every agreeing case in testing passed.
+   - **closed-loop drag:** move the handle in small steps while reading where the piece
+     actually is, release when it sits on the gap. No assumption about the handle-to-piece
+     ratio, page zoom or device pixel ratio.
+   - **verdict:** page leaves `/verify/` or shows 成功 → pass; 失败/错误 or the piece snapping
+     back → fail, then refresh (some widgets keep the same image after a failure). Up to
+     `CNKI_SLIDER_ATTEMPTS` (6).
+   Measured 2026-11-02: **download gate 15/15**, **kns slider 10/10** (most on the first
+   image, ~3 s; worst ~10 s), click-word unaffected (6/6).
 4. If both fail: see "skipped, not waited on" below.
 
 **Chained captchas.** CNKI often serves a second captcha right after the first one
@@ -120,7 +135,7 @@ chains) were all cleared in 13–18 s and all six articles were read.
 
 Measured on live CNKI captchas, 2026-11-01 (verify page opened directly, nothing else
 driving the browser): **click-word 15/15**, 11–19 s each, most passing on the 2nd–6th
-image; **slider 10/10** plus an earlier 5/5, a few seconds each. An earlier version that
+image; slider results are under item 3. An earlier click-word version that
 read characters freely and fell back to a vision model was slower (30–110 s) and failed
 most attempts; it was removed.
 
@@ -142,7 +157,10 @@ twice). Set `CNKI_CAPTCHA_WAIT=300` to restore the old wait-for-the-human behavi
 
 To test the solvers on demand: a verify URL from a real trigger (with its `ident`,
 `captchaId` and `returnUrl`) can be reopened and serves a fresh captcha each time;
-swapping `captchaType=clickWord` for `blockPuzzle` gives the slider.
+swapping `captchaType=clickWord` for `blockPuzzle` gives the slider. The download gate is
+captured the same way: click `#pdfDown` with downloads denied
+(`Browser.setDownloadBehavior` `deny`) until a `bar.cnki.net/bar/verify` tab appears, save its
+URL, and reopen it for fresh images. After one pass CNKI may stop showing the gate for a while.
 
 The user's school network office approved automated captcha solving
 (2026-11-01). CNKI's own terms may still disallow it; keep volumes modest.

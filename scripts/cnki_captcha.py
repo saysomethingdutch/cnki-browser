@@ -199,233 +199,244 @@ def solve(pg):
 
 
 # ---------------------------------------------------------------------------
-# Slider ("向右滑动完成验证", captchaType=blockPuzzle)
+# Slider captchas — one adaptive solver for every "drag the piece into the gap" variant
 #
-# CNKI's own VerifySlide component (verify/js/342.*.js) works like this:
-#   - background <img> 310x155 and a piece <img> 47x155 (PNG with alpha) inside
-#     .verify-sub-block, which moves with the handle .verify-move-block;
-#   - mousedown on the handle, mousemove on window, mouseup on window;
-#   - on mouseup it sends x = 310 * moveBlockLeft / imgWidth to /verify-api/web/check.
-# So the piece's x on the background equals the handle's travel in page pixels,
-# scaled by imgWidth/310.
+# CNKI shows at least two slider widgets with unrelated DOM:
+#   kns.cnki.net/verify/home?captchaType=blockPuzzle  (.verify-img-panel / .verify-sub-block / .verify-move-block)
+#   bar.cnki.net/bar/verify/... on PDF download       (Tencent: .tencent-captcha-dy__verify-bg-img / __fg-item / __slider-block)
+# Rather than one hand-written solver per widget, this finds the parts by structure:
+#   background = the largest visible image-bearing element (>= 200 px wide)
+#   piece      = an image-bearing element inside the background, 8–45 % of its width, at the left
+#   handle     = a small pointer-cursor element below the background, inside its horizontal span
+# and then:
+#   1. shape    — screenshot the background with and without the piece; the difference is the
+#                 piece's exact silhouette (no class names, no sprite parsing)
+#   2. gap      — slide that silhouette along its own rows of the piece-hidden background and score
+#                 "ring brighter than inside" (the gap is a shaded copy of the piece); confidence =
+#                 best score / best score elsewhere, so decoy outlines and busy photos are rejected
+#   3. drag     — closed loop: move the handle in small steps while reading where the piece actually
+#                 is, and release when it sits on the gap. No assumption about the handle/piece ratio,
+#                 page zoom or device pixel ratio.
+#   4. verdict  — the page leaves /verify/, or shows 成功 → pass; 失败/错误 or the piece snapping back → fail
 # ---------------------------------------------------------------------------
 
-SLIDER_JS = r"""() => {
-  const bg = [...document.querySelectorAll('.verify-img-panel img')].find(i => (i.src||'').startsWith('data:image'));
-  const pc = document.querySelector('.verify-sub-block img');
-  const h = document.querySelector('.verify-move-block');
-  if (!bg || !pc || !h) return null;
-  const rb = bg.getBoundingClientRect(), rh = h.getBoundingClientRect();
-  if (rb.width < 100 || rh.width < 10 || rb.top < -1000) return null;
-  return {bg: bg.src, piece: pc.src, bgx: rb.left, bgw: rb.width, nw: bg.naturalWidth,
-          hx: rh.left + rh.width / 2, hy: rh.top + rh.height / 2};
+SLIDER_FIND_JS = r"""() => {
+  const vis = e => { const r = e.getBoundingClientRect(); const s = getComputedStyle(e);
+    return r.width > 0 && r.height > 0 && r.top > -500 && s.visibility !== 'hidden' && s.display !== 'none'; };
+  const hasImg = e => e.tagName === 'IMG' || e.tagName === 'CANVAS'
+    || (getComputedStyle(e).backgroundImage || 'none') !== 'none' || !!e.querySelector('img,canvas');
+  const all = [...document.querySelectorAll('body *')].filter(vis);
+  const imgs = all.filter(e => (e.tagName === 'IMG' || e.tagName === 'CANVAS'
+    || (getComputedStyle(e).backgroundImage || 'none') !== 'none'));
+  const bgs = imgs.map(e => [e, e.getBoundingClientRect()])
+    .filter(([e, r]) => r.width >= 200 && r.height >= 80 && r.width <= innerWidth * 0.8 && r.height <= innerHeight * 0.8)
+    .sort((a, b) => b[1].width * b[1].height - a[1].width * a[1].height);
+  const tag = (e) => { e.dataset.cnkiSlider = e.dataset.cnkiSlider || Math.random().toString(36).slice(2); return e.dataset.cnkiSlider; };
+  const R = r => ({x: r.left, y: r.top, w: r.width, h: r.height});
+  // try background candidates from largest down; keep the first that has a piece and a handle
+  for (const [bg, rb] of bgs) {
+    const pieces = all.filter(e => e !== bg && !e.contains(bg) && hasImg(e)).map(e => [e, e.getBoundingClientRect()])
+      .filter(([e, r]) => r.width >= rb.width * 0.08 && r.width <= rb.width * 0.45 && r.height <= rb.height * 1.05
+        && r.left >= rb.left - 5 && r.left < rb.left + rb.width * 0.35
+        && r.top < rb.bottom && r.bottom > rb.top)
+      .sort((a, b) => a[1].left - b[1].left);
+    const handles = all.map(e => [e, e.getBoundingClientRect()])
+      .filter(([e, r]) => getComputedStyle(e).cursor === 'pointer' && r.width >= 24 && r.width <= 140 && r.height >= 20 && r.height <= 90
+        && r.top >= rb.top + rb.height * 0.5 && r.top <= rb.bottom + 120 && r.left >= rb.left - 5 && r.left < rb.left + rb.width * 0.4
+        && !(r.top < rb.bottom - 5 && r.bottom > rb.top + 5))
+      .sort((a, b) => (a[1].top - b[1].top) || (a[1].left - b[1].left));
+    if (pieces.length && handles.length)
+      return {bg: tag(bg), piece: tag(pieces[0][0]), handle: tag(handles[0][0]),
+              rb: R(rb), rp: R(pieces[0][1]), rh: R(handles[0][1])};
+  }
+  return null;
 }"""
 
-SLIDER_MIN_SCORE = 0.28
+SLIDER_MIN_CONF = float(os.environ.get("CNKI_SLIDER_MIN_CONF", "2.7"))  # single-cue threshold; agreeing cues always drag
 
 
-def slider_offset(bg_png, piece_png):
-    """Return (x, score): where the piece's left edge belongs on the background, in natural pixels."""
+def slider_target(full_png, back_png, rp, rb):
+    """Where the piece's left edge must go (CSS px, relative to the background), and confidence.
+
+    full_png / back_png: screenshots of the background element with the piece shown / hidden.
+    """
     import numpy as np, cv2
-    bg = cv2.imdecode(np.frombuffer(bg_png, np.uint8), cv2.IMREAD_COLOR)
-    pc = cv2.imdecode(np.frombuffer(piece_png, np.uint8), cv2.IMREAD_UNCHANGED)
-    if bg is None or pc is None or pc.ndim != 3 or pc.shape[2] != 4:
+    F = cv2.imdecode(np.frombuffer(full_png, np.uint8), cv2.IMREAD_COLOR)
+    B = cv2.imdecode(np.frombuffer(back_png, np.uint8), cv2.IMREAD_COLOR)
+    if F is None or B is None or F.shape != B.shape:
         return None, 0.0
-    alpha = pc[:, :, 3]
-    ys, xs = np.where(alpha > 0)
-    if not len(ys):
+    s = B.shape[1] / rb["w"]
+    x0 = max(0, int((rp["x"] - rb["x"]) * s)); y0 = max(0, int((rp["y"] - rb["y"]) * s))
+    w = min(int(rp["w"] * s), B.shape[1] - x0); h = min(int(rp["h"] * s), B.shape[0] - y0)
+    if w < 8 or h < 8:
         return None, 0.0
-    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
-    mask = (alpha[y0:y1, x0:x1] > 0).astype(np.uint8) * 255
-    outline = cv2.morphologyEx(mask, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))
-    band = bg[max(0, y0 - 3):y1 + 3]
-    edges = cv2.Canny(cv2.cvtColor(band, cv2.COLOR_BGR2GRAY), 60, 180)
-    if edges.shape[0] < outline.shape[0] or edges.shape[1] < outline.shape[1]:
+    d = np.abs(F[y0:y0 + h, x0:x0 + w].astype(int) - B[y0:y0 + h, x0:x0 + w].astype(int)).sum(axis=2)
+    mask = cv2.morphologyEx((d > 40).astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    ys, xs = np.where(mask)
+    if len(ys) < 50:
         return None, 0.0
+    mx0, mx1, my0, my1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+    m = mask[my0:my1, mx0:mx1]
+    ring = cv2.dilate(m, np.ones((9, 9), np.uint8)) - m
+    inside = m.astype(np.float32) / m.sum(); outside = ring.astype(np.float32) / max(ring.sum(), 1)
+    band = cv2.cvtColor(B, cv2.COLOR_BGR2GRAY).astype(np.float32)[y0 + my0:y0 + my1]
+    if band.shape[0] < m.shape[0]:
+        return None, 0.0
+    W = band.shape[1] - m.shape[1]
+    start = x0 + mx0 + m.shape[1]
+    if W <= start + 2:
+        return None, 0.0
+
+    def confidence(score):
+        score = score.copy(); score[:start] = -1
+        gx = int(np.argmax(score)); best = float(score[gx])
+        far = np.abs(np.arange(len(score)) - gx) > m.shape[1] * 0.6
+        far[:start] = False
+        second = float(score[far].max()) if far.any() else 0.0
+        return gx, best / max(second, 1e-6)
+
+    # cue 1: shading — the gap is a darker/lighter copy of the piece (strong on the Tencent download gate)
+    a = cv2.filter2D(band, -1, inside, anchor=(0, 0), borderType=cv2.BORDER_CONSTANT)
+    b = cv2.filter2D(band, -1, outside, anchor=(0, 0), borderType=cv2.BORDER_CONSTANT)
+    shade = np.abs(b - a)[0, :W]
+    gx1, c1 = confidence(shade)
+    # cue 2: outline — the gap's edges have the piece's shape (strong on kns, where decoys are outlined too)
+    outline = cv2.morphologyEx(m * 255, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))
+    edges = cv2.Canny(band.astype(np.uint8), 50, 150)
     res = cv2.matchTemplate(edges, outline, cv2.TM_CCORR_NORMED)
-    # the piece starts at x=0 and always overlaps its own spot there; skip the first piece-width
-    res[:, : max(1, x1 - x0)] = 0
-    _, score, _, loc = cv2.minMaxLoc(res)
-    return int(loc[0] - x0), float(score)
-
-
-def _drag_path(dx):
-    """Ease-out path with a small overshoot and settle, like a hand."""
-    pts, n = [], random.randint(22, 32)
-    over = dx + random.uniform(2, 5)
-    for i in range(1, n + 1):
-        f = 1 - (1 - i / n) ** 3
-        pts.append((over * f, random.uniform(-1.2, 1.2)))
-    for k in range(random.randint(3, 5)):
-        pts.append((over - (over - dx) * (k + 1) / 4, random.uniform(-0.6, 0.6)))
-    pts.append((dx, 0))
-    return pts
+    edge = res.max(axis=0)[:W] if res.shape[1] >= W else np.pad(res.max(axis=0), (0, W - res.shape[1]))
+    gx2, c2 = confidence(edge)
+    if abs(gx1 - gx2) <= 3 * s and max(c1, c2) >= 1.5:
+        # both cues agree: on 2026-11-02 every agreeing case passed, so always trust it
+        gx, conf = (gx1 + gx2) // 2, max(SLIDER_MIN_CONF, max(c1, c2) * 1.5)
+        cue = "both"
+    elif c1 >= c2:
+        gx, conf, cue = gx1, c1, "shade"
+    else:
+        gx, conf, cue = gx2, c2, "edge"
+    print(f"captcha  slider cues shade={gx1 / s:.0f}@{c1:.1f} edge={gx2 / s:.0f}@{c2:.1f} -> {cue}", file=sys.stderr)
+    return (gx - mx0) / s, conf
 
 
 def _slider_page(pg):
+    pages = [pg]
     try:
-        info = pg.evaluate(SLIDER_JS)
+        pages += [p for p in pg.context.pages if p is not pg]
     except Exception:
-        info = None
-    if info:
-        return pg, info
-    try:
-        pages = pg.context.pages
-    except Exception:
-        return pg, None
+        pass
     for p in pages:
         try:
-            if p is pg or "/verify/" not in (p.url or ""):
+            if p.is_closed() or "/verify/" not in (p.url or ""):
                 continue
-            i2 = p.evaluate(SLIDER_JS)
-            if i2:
-                return p, i2
+            info = p.evaluate(SLIDER_FIND_JS)
+            if info:
+                return p, info
         except Exception:
             continue
     return pg, None
 
 
-def solve_slider(pg, attempts=4):
-    """Solve CNKI's blockPuzzle slider. Returns True when the verify page goes away."""
+def _sel(token):
+    return f'[data-cnki-slider="{token}"]'
+
+
+def _slider_verdict(page, piece_sel, start_x, timeout=4.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        time.sleep(0.25)
+        try:
+            if page.is_closed() or "/verify/" not in (page.url or ""):
+                return "pass"
+            txt = page.inner_text("body")
+        except Exception:
+            return "pass"
+        if "成功" in txt:
+            return "pass"
+        if re.search(r"失败|错误|再试", txt):
+            return "fail"
+        try:
+            box = page.locator(piece_sel).first.bounding_box()
+            if box and abs(box["x"] - start_x) < 2:
+                return "fail"
+        except Exception:
+            pass
+    return "none"
+
+
+def solve_slider(pg, attempts=int(os.environ.get("CNKI_SLIDER_ATTEMPTS", "6"))):
+    """Adaptive slider solver; see the section comment. Returns True when the captcha passes."""
     for i in range(attempts):
         page, info = _slider_page(pg)
         if not info:
             return False
-        bg = base64.b64decode(info["bg"].split(",", 1)[1])
-        pc = base64.b64decode(info["piece"].split(",", 1)[1])
-        x, score = slider_offset(bg, pc)
-        print(f"captcha  slider match x={x} score={score:.3f}", file=sys.stderr)
-        if x is None or score < SLIDER_MIN_SCORE:
-            return False
-        dx = x * info["bgw"] / info["nw"]
-        page.mouse.move(info["hx"], info["hy"], steps=random.randint(6, 12))
-        time.sleep(random.uniform(0.2, 0.45))
+        bg, piece, handle = page.locator(_sel(info["bg"])).first, page.locator(_sel(info["piece"])).first, page.locator(_sel(info["handle"])).first
+        rb, rp, rh = info["rb"], info["rp"], info["rh"]
+        try:
+            full = bg.screenshot(timeout=4000)
+            page.evaluate("(s) => { const e = document.querySelector(s); e.dataset.cnkiVis = e.style.visibility; e.style.visibility = 'hidden'; }", _sel(info["piece"]))
+            back = bg.screenshot(timeout=4000)
+        finally:
+            try:
+                page.evaluate("(s) => { const e = document.querySelector(s); e.style.visibility = e.dataset.cnkiVis || ''; }", _sel(info["piece"]))
+            except Exception:
+                pass
+        target, conf = slider_target(full, back, rp, rb)
+        print(f"captcha  slider target={target if target is None else round(target, 1)} conf={conf:.1f}", file=sys.stderr)
+        if target is None or conf < SLIDER_MIN_CONF:
+            _refresh_slider(page)
+            continue
+        sx, sy = rh["x"] + rh["w"] / 2, rh["y"] + rh["h"] / 2
+        page.mouse.move(sx, sy, steps=random.randint(5, 9))
+        time.sleep(random.uniform(0.15, 0.3))
         page.mouse.down()
-        for px, py in _drag_path(dx):
-            page.mouse.move(info["hx"] + px, info["hy"] + py)
-            time.sleep(random.uniform(0.012, 0.03))
-        time.sleep(random.uniform(0.15, 0.35))
+        time.sleep(random.uniform(0.08, 0.15))
+        hand, moved, last = 0.0, False, None
+        for _ in range(120):
+            box = piece.bounding_box()
+            if not box:
+                break
+            pos = box["x"] - rb["x"]
+            if last is not None and abs(pos - last) > 0.3:
+                moved = True
+            last = pos
+            err = target - pos
+            if abs(err) < 0.8:
+                break
+            if hand > 25 and not moved:
+                break
+            step = max(0.6, min(abs(err) * 0.45, 14)) * (1 if err > 0 else -1)
+            hand += step
+            page.mouse.move(sx + hand, sy + random.uniform(-0.8, 0.8))
+            time.sleep(random.uniform(0.01, 0.025))
+        time.sleep(random.uniform(0.15, 0.3))
         page.mouse.up()
-        verdict = _slider_verdict(page)
+        if not moved:
+            print("captcha  slider: piece did not follow the handle; wrong parts picked", file=sys.stderr)
+            return False
+        verdict = _slider_verdict(page, _sel(info["piece"]), rp["x"])
         if verdict == "pass":
-            print("captcha  slider passed", file=sys.stderr)
-            time.sleep(1.5)
+            print(f"captcha  slider passed (attempt {i + 1})", file=sys.stderr)
+            time.sleep(1.2)
             return True
-        print(f"captcha  slider attempt {i + 1}: {verdict}, new image", file=sys.stderr)
-        time.sleep(random.uniform(1.2, 1.8))
+        print(f"captcha  slider attempt {i + 1}: {verdict}", file=sys.stderr)
+        time.sleep(random.uniform(0.8, 1.2))
+        # some widgets keep the same image after a failure; ask for a new one
+        _refresh_slider(page)
     return False
 
 
-def _slider_verdict(page, timeout=4.0):
-    """Read the widget's own result: icon-check / 验证成功 = pass, icon-close / 验证失败 = fail.
-    The page navigates away ~1 s after a pass, so a vanished widget also counts as a pass."""
-    js = """() => { const i = document.querySelector('.verify-move-block i');
-                     const t = document.querySelector('.verify-tips');
-                     return {icon: i ? i.className : '', tip: t ? t.innerText : '',
-                             here: !!document.querySelector('.verify-move-block')}; }"""
-    end = time.time() + timeout
-    while time.time() < end:
-        time.sleep(0.2)
+def _refresh_slider(page):
+    for sel in (".verify-refresh", "[class*=refresh]", "[class*=reload]", "[aria-label*=刷新]", "[title*=刷新]"):
         try:
-            s = page.evaluate(js)
+            loc = page.locator(sel).first
+            if loc.count() and loc.is_visible():
+                loc.click(timeout=2000)
+                time.sleep(random.uniform(1.0, 1.6))
+                return
         except Exception:
-            return "pass"
-        if "icon-check" in s["icon"] or "成功" in s["tip"]:
-            return "pass"
-        if "icon-close" in s["icon"] or "失败" in s["tip"]:
-            return "fail"
-        if not s["here"]:
-            return "pass"
-    return "no-verdict"
-
-
-# ------------------------------------------------- bar.cnki.net 下载闸门（滑块-方框式）
-BAR_FIND_JS = r"""() => {
-  const bg = document.querySelector('.tencent-captcha-dy__verify-bg-img');
-  const hd = document.querySelector('.tencent-captcha-dy__slider-block');
-  if (!bg || !hd) return null;
-  const rb = bg.getBoundingClientRect(), rh = hd.getBoundingClientRect();
-  return {bg: {x: rb.left, y: rb.top, w: rb.width, h: rb.height},
-          hd: {x: rh.left, y: rh.top, w: rh.width, h: rh.height}};
-}"""
-
-
-def _find_boxes(png):
-    """背景里有两个方框：左=拼图起点，右=缺口。返回 (dx_img_px, side, y1, y2) 或 None。"""
-    import cv2, numpy as np
-    im = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
-    if im is None:
-        return None
-    g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-    e = cv2.Canny(g, 40, 120)
-    cnts, _ = cv2.findContours(e, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    H = im.shape[0]
-    cands = []
-    for c in cnts:
-        x, y, w, h = cv2.boundingRect(c)
-        if not (H * 0.10 <= h <= H * 0.5):
             continue
-        if not (0.70 <= w / max(h, 1) <= 1.40):
-            continue
-        cands.append((x, y, w, h))
-    # 全组合配对：两个方框尺寸相近、纵向对齐、横向有足够间隔；取尺寸差最小的一对
-    best = None
-    for i in range(len(cands)):
-        for j in range(i + 1, len(cands)):
-            a, b = cands[i], cands[j]
-            wa, wb = (a[2] + b[2]) / 2, (a[3] + b[3]) / 2
-            if abs(a[2] - b[2]) > 0.20 * wa or abs(a[3] - b[3]) > 0.25 * wb:
-                continue
-            if abs(a[1] - b[1]) > 0.30 * wb:
-                continue
-            dx = abs(b[0] - a[0])
-            if dx < 1.2 * wa or dx > 0.95 * im.shape[1]:
-                continue
-            score = abs(a[2] - b[2]) + abs(a[3] - b[3]) + abs(a[1] - b[1]) * 0.5
-            if best is None or score < best[0]:
-                left, right = (a, b) if a[0] < b[0] else (b, a)
-                best = (score, right[0] - left[0], left[2], left[1], right[1])
-    if not best:
-        return None
-    return best[1], best[2], best[3], best[4]
-
-
-def solve_slider_bar(pg):
-    """bar.cnki.net 的下载验证：拖动下方滑块完成拼图（两个方框）。"""
     try:
-        info = pg.evaluate(BAR_FIND_JS)
+        page.reload(wait_until="domcontentloaded")
     except Exception:
-        return False
-    if not info:
-        return False
-    try:
-        shot = pg.locator(".tencent-captcha-dy__verify-bg-img").first.screenshot(timeout=4000)
-    except Exception:
-        return False
-    found = _find_boxes(shot)
-    if not found:
-        print("slider-bar  没找到两个方框", file=sys.stderr)
-        return False
-    dx_img, side, ya, yb = found
-    from PIL import Image
-    import io as _io
-    iw = Image.open(_io.BytesIO(shot)).width
-    scale = info["bg"]["w"] / max(iw, 1)
-    dx = dx_img * scale
-    h = info["hd"]
-    sx, sy = h["x"] + h["w"] / 2, h["y"] + h["h"] / 2
-    pg.mouse.move(sx, sy)
-    time.sleep(random.uniform(0.12, 0.25))
-    pg.mouse.down()
-    time.sleep(random.uniform(0.08, 0.16))
-    n = 46
-    for i in range(1, n + 1):
-        t = i / n
-        off = dx * (1 - (1 - t) ** 3)
-        pg.mouse.move(sx + off, sy + random.uniform(-0.8, 0.8))
-        time.sleep(random.uniform(0.006, 0.016) if i < 24 else random.uniform(0.012, 0.026))
-    time.sleep(random.uniform(0.15, 0.3))
-    pg.mouse.up()
-    print(f"slider-bar  drag dx={dx:.1f}px (img dx={dx_img}, side={side})", file=sys.stderr)
-    time.sleep(1.8)
-    return True
+        pass
+    time.sleep(random.uniform(1.2, 2.0))
