@@ -20,7 +20,7 @@ FIND_JS = r"""() => {
   const imgs = [...document.querySelectorAll('img')].filter(i => (i.src||'').startsWith('data:image') );
   const vis = imgs.filter(i => { const r = i.getBoundingClientRect(); return r.width > 150 && r.height > 60 && r.top > -1000; });
   const msg = [...document.querySelectorAll('.verify-msg, .verify-bar-area span, [class*=verify] span')]
-               .map(e => e.innerText.trim()).find(t => /依次点击/.test(t)) || '';
+               .map(e => e.innerText.trim()).find(t => /依次(?:点击|单击)/.test(t)) || '';
   if (!vis.length) return null;
   const im = vis[0], r = im.getBoundingClientRect();
   return {src: im.src, x: r.left, y: r.top, w: r.width, h: r.height, nw: im.naturalWidth, nh: im.naturalHeight, msg};

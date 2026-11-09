@@ -82,7 +82,7 @@ python3 cnki_detail.py URL --download --caj --dest papers_cn/    # CAJ when ther
 1. Detects the Tencent widget (`#tCaptchaDyContent`; it sits off-screen at
    y=-1000000 until triggered — visibility is checked by position, not existence)
    and the full-page `/verify/` click-word captcha.
-2. **Click-word** (`cnki_captcha.solve`, `请依次点击【呢,场,小】`). Everything is local:
+2. **Click-word** (`cnki_captcha.solve`, `请依次点击【呢,场,小】` or `请依次单击【呢,场,小】`). Everything is local:
    - ddddocr detects character boxes. It does **not** read each box freely — on rotated,
      coloured characters free reading is wrong more often than right. Instead, for each
      required character it asks the OCR model how likely that character is in each box
