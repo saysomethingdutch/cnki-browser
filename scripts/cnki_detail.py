@@ -12,6 +12,7 @@ script checks the file really is a PDF (or CAJ) and not an HTML error page.
 Exit codes as in cnki_common.
 """
 import argparse, json, pathlib, random, re, shutil, sys, time
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import cnki_common as C
@@ -72,6 +73,11 @@ def check_file(p):
     if b"<html" in p.read_bytes()[:2000].lower() or b"<!doctype" in p.read_bytes()[:200].lower():
         return "html"
     return "unknown"
+
+
+def is_cnki_page(page):
+    host = urlsplit(page.url).hostname or ""
+    return host == "cnki.net" or host.endswith(".cnki.net")
 
 
 def download(ctx, pg, dest, info, caj=False, browser=None):
@@ -150,9 +156,9 @@ def main():
     dest = pathlib.Path(a.dest).expanduser()
     out_lines, n_ok, n_new, skipped = [], 0, 0, []
     with C.attached() as (ctx, pg):
-        # 清掉上次残留的标签页（专用 profile，都是本脚本开的）
+        # 清掉上次残留的知网标签页，保留其他数据库会话。
         for extra in list(ctx.pages):
-            if extra is not pg:
+            if extra is not pg and is_cnki_page(extra):
                 try:
                     extra.close()
                 except Exception:
@@ -162,17 +168,18 @@ def main():
             nonlocal pg
             if not pg.is_closed():
                 return pg
-            for cand in ctx.pages:
+            cnki_pages = [cand for cand in ctx.pages if is_cnki_page(cand)]
+            for cand in cnki_pages:
                 if not cand.is_closed() and "/verify/" not in (cand.url or ""):
                     pg = cand
                     return pg
-            pg = ctx.pages[0] if ctx.pages else ctx.new_page()
+            pg = cnki_pages[0] if cnki_pages else ctx.new_page()
             return pg
 
         for i, url in enumerate(urls):
             page = live_page()
             for stale in list(ctx.pages):
-                if stale is not page and not stale.is_closed() and "/verify/" in (stale.url or ""):
+                if stale is not page and not stale.is_closed() and is_cnki_page(stale) and "/verify/" in stale.url:
                     try:
                         stale.close()
                     except Exception:

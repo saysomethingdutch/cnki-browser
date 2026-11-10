@@ -1,6 +1,6 @@
 ---
 name: cnki-browser
-description: Search and download from 中国知网 (CNKI) by script, not by screenshot. Use when a task needs CNKI search counts, result lists, abstracts, or full-text PDFs — 知网检索、知网下载、查文献热度、补全文. Attaches Playwright to a dedicated logged-in Chrome; reads the result table and detail pages from the DOM; downloads PDFs through Chrome; auto-solves the click-word and slider captchas locally (ddddocr + OpenCV, no external model) and skips the article if that fails.
+description: Search and download from 中国知网 (CNKI) and HeinOnline, or search journals and check case history in Westlaw, through a dedicated signed-in Chrome. Use when a task needs CNKI search counts, result lists, abstracts, or full-text PDFs — 知网检索、知网下载、查文献热度、补全文. Attaches Playwright to a dedicated logged-in Chrome; reads the result table and detail pages from the DOM; downloads PDFs through Chrome; auto-solves the click-word and slider captchas locally (ddddocr + OpenCV, no external model) and skips the article if that fails.
 ---
 
 # CNKI Browser
@@ -74,6 +74,41 @@ python3 cnki_detail.py URL --download --caj --dest papers_cn/    # CAJ when ther
 - File names: first author with affiliation digits and punctuation stripped
   (`段阳伟1,` → `段阳伟`); the year comes from the source line, or, for 网络首发
   papers that have no issue yet, from the online date.
+
+## HeinOnline and Westlaw
+
+In the dedicated Chrome started above, open HeinOnline and Westlaw through
+the institution and complete sign-in by hand. Leave both database tabs open.
+Run the following commands one at a time in that browser profile.
+
+```bash
+python3 scripts/foreign_browser.py hein-batch queries.json --out hein_results
+python3 scripts/foreign_browser.py hein-pdf 'ARTICLE_URL_FROM_RESULTS' --out papers/article.pdf
+python3 scripts/foreign_browser.py westlaw-journals 'licen! /s restrict!' --out westlaw_hits.json
+python3 scripts/foreign_browser.py westlaw-keycite '176 F.3d 1132' --out keycite.json
+```
+
+- HeinOnline searches the **Law Journal Library**. The query file is a JSON
+  array such as `[{"id":"q1","query":"Wassenaar AND \"General Technology Note\""}]`.
+  Supply HeinOnline Boolean syntax. By default each query records up to 30
+  results by relevance and scans newest volume date first to the 2024 boundary,
+  with a cap of 100 recent rows. The JSON records whether the boundary was
+  reached. Use `--relevance`, `--since` or `--recent-limit` to change the scope.
+  Successful query files are reused on resume. Use a new directory when changing
+  the query or scope. Provider summaries are marked as such.
+- `hein-pdf` clicks the article page's **Download PDF of This Section** and
+  verifies the file signature. Check the title and page range before citing it.
+- `westlaw-journals` uses the **Law Reviews & Journals** filter in Westlaw
+  Classic. It records the total and the first page. Use Westlaw Terms and
+  Connectors in the query, including `!` for word endings, a space for OR,
+  `/s` for the same sentence, and `/p` for the same paragraph.
+- `westlaw-keycite` opens a reporter citation in Westlaw Classic and records
+  **Direct History** with the available case links. Repeat
+  `--pdf 'CITATION=PATH'` to obtain the original image for a selected case in
+  that history when the page exposes one. The history export does not collect
+  the separate Citing References tab.
+
+Verified against the institutional interfaces on 2026-11-10.
 
 ## Captcha
 
