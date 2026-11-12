@@ -199,12 +199,14 @@ def solve(pg):
 
 
 # ---------------------------------------------------------------------------
-# Slider captchas — one adaptive solver for every "drag the piece into the gap" variant
+# Slider captchas — image-gap variants plus the HTML reader's linear track slider
 #
-# CNKI shows at least two slider widgets with unrelated DOM:
+# CNKI shows three slider widgets with unrelated DOM:
 #   kns.cnki.net/verify/home?captchaType=blockPuzzle  (.verify-img-panel / .verify-sub-block / .verify-move-block)
 #   bar.cnki.net/bar/verify/... on PDF download       (Tencent: .tencent-captcha-dy__verify-bg-img / __fg-item / __slider-block)
-# Rather than one hand-written solver per widget, this finds the parts by structure:
+#   kns.cnki.net/reader/xml HTML gate                 (.read-btn-boxXml .slider-wrapper / #js-handler)
+# Image-gap widgets are discovered from their structure; the HTML reader uses its
+# dedicated track/handle selector and a text-growth verdict. For image gaps:
 #   background = the largest visible image-bearing element (>= 200 px wide)
 #   piece      = an image-bearing element inside the background, 8–45 % of its width, at the left
 #   handle     = a small pointer-cursor element below the background, inside its horizontal span
@@ -363,8 +365,100 @@ def _slider_verdict(page, piece_sel, start_x, timeout=4.0):
     return "none"
 
 
+READER_SLIDER_STATE_JS = r"""() => {
+  const root = document.querySelector('.read-btn-boxXml .slider-wrapper');
+  const rect = e => { if (!e) return null; const r=e.getBoundingClientRect();
+    return {x:r.left,y:r.top,w:r.width,h:r.height,right:r.right,bottom:r.bottom}; };
+  const visible = e => { if (!e) return false; const r=e.getBoundingClientRect(); const s=getComputedStyle(e);
+    if (r.width < 20 || r.height < 20 || r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth
+        || s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false;
+    for (let p=e.parentElement;p;p=p.parentElement) { const q=getComputedStyle(p);
+      if (q.display === 'none' || q.visibility === 'hidden' || +q.opacity === 0) return false; }
+    return true; };
+  const message = root?.querySelector('.drag_text')?.innerText?.trim() || '';
+  const track = root?.querySelector('.drag-bg-box');
+  const handle = root?.querySelector('#js-handler, .handler');
+  const content = document.querySelector('#printContent');
+  return {visible:visible(root), captcha:visible(root) && message.includes('向右滑动验证') && message.includes('继续阅读全文'),
+    message, track:rect(track), handle:rect(handle), contentLength:(content?.innerText || '').length};
+}"""
+
+
+def _reader_slider_page(pg):
+    pages = [pg]
+    try:
+        pages += [p for p in pg.context.pages if p is not pg]
+    except Exception:
+        pass
+    for p in pages:
+        try:
+            if p.is_closed() or "/reader/xml" not in (p.url or ""):
+                continue
+            info = p.evaluate(READER_SLIDER_STATE_JS)
+            if info and info.get("captcha") and info.get("track") and info.get("handle"):
+                return p, info
+        except Exception:
+            continue
+    return pg, None
+
+
+def solve_reader_slider(page, info=None, timeout=15.0):
+    """Drag the CNKI HTML-reader track to its right stop and verify the text unlocked."""
+    if info is None:
+        page, info = _reader_slider_page(page)
+    if not info:
+        return False
+    track, handle = info["track"], info["handle"]
+    distance = track["right"] - handle["w"] - handle["x"]
+    if distance < 3:
+        print("captcha  reader slider is already at the right stop; checking reader state", file=sys.stderr)
+    else:
+        sx, sy = handle["x"] + handle["w"] / 2, handle["y"] + handle["h"] / 2
+        # This widget fires success only after movement exceeds maxwidth; stopping
+        # exactly at the track end makes mouseup reset the handle to zero.
+        target_x = sx + distance + 3
+        steps = max(12, min(36, int(distance / 10)))
+        print(f"captcha  reader slider drag={distance:.0f}px in {steps} steps", file=sys.stderr)
+        try:
+            page.mouse.move(sx, sy, steps=6)
+            time.sleep(0.12)
+            page.mouse.down()
+            for i in range(1, steps + 1):
+                page.mouse.move(sx + (target_x - sx) * i / steps, sy, steps=1)
+                time.sleep(0.015)
+            time.sleep(0.12)
+        finally:
+            try:
+                page.mouse.up()
+            except Exception:
+                pass
+        time.sleep(0.6)
+    baseline = info.get("contentLength", 0)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            state = page.evaluate(READER_SLIDER_STATE_JS)
+        except Exception:
+            state = None
+        if state:
+            message = state.get("message", "")
+            if re.search(r"验证失败|滑动失败|请重试|发生错误", message):
+                print(f"captcha  reader slider rejected: {message}", file=sys.stderr)
+                return False
+            unlocked = not state.get("captcha") and not state.get("visible")
+            if unlocked and state.get("contentLength", 0) >= baseline + 50:
+                print(f"captcha  reader slider passed; reader text {baseline}->{state['contentLength']} chars", file=sys.stderr)
+                return True
+        time.sleep(0.25)
+    print("captcha  reader slider did not unlock more reader text", file=sys.stderr)
+    return False
+
+
 def solve_slider(pg, attempts=int(os.environ.get("CNKI_SLIDER_ATTEMPTS", "6"))):
-    """Adaptive slider solver; see the section comment. Returns True when the captcha passes."""
+    """Solve the HTML-reader track gate or an image-gap slider; return True only on success."""
+    reader_page, reader_info = _reader_slider_page(pg)
+    if reader_info:
+        return solve_reader_slider(reader_page, reader_info)
     for i in range(attempts):
         page, info = _slider_page(pg)
         if not info:

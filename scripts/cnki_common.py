@@ -9,7 +9,7 @@ PAUSE = tuple(float(x) for x in os.environ.get("CNKI_PAUSE", "2.0,4.5").split(",
 
 EXIT_OK, EXIT_ERR, EXIT_LOGIN, EXIT_BROWSER, EXIT_CAPTCHA, EXIT_LAYOUT = 0, 1, 3, 4, 5, 6
 
-CAPTCHA_SEL = "#tCaptchaDyContent, .tencent-captcha-dy__content"
+CAPTCHA_SEL = "#tCaptchaDyContent, .tencent-captcha-dy__content, .read-btn-boxXml .slider-wrapper"
 
 
 class SkillError(Exception):
@@ -70,12 +70,21 @@ def captcha_visible(pg):
     except Exception:
         return False
     return pg.evaluate("""(sel) => {
-      const e = document.querySelector(sel); if (!e) return false;
-      const r = e.getBoundingClientRect(); if (r.width < 20 || r.height < 20) return false;
-      if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) return false;
-      for (let x = e; x; x = x.parentElement) { const s = getComputedStyle(x);
-        if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false; }
-      return true; }""", CAPTCHA_SEL) or bool(re.search(r"/verify/", pg.url))
+      const visible = e => {
+        const r = e.getBoundingClientRect();
+        if (r.width < 20 || r.height < 20 || r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) return false;
+        for (let x = e; x; x = x.parentElement) { const s = getComputedStyle(x);
+          if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false; }
+        return true;
+      };
+      return [...document.querySelectorAll(sel)].some(e => {
+        if (!visible(e)) return false;
+        if (e.matches('.read-btn-boxXml .slider-wrapper')) {
+          const text = e.querySelector('.drag_text')?.innerText || '';
+          return text.includes('向右滑动验证') && text.includes('继续阅读全文');
+        }
+        return true;
+      }); }""", CAPTCHA_SEL) or bool(re.search(r"/verify/", pg.url))
 
 
 def _safe_visible(pg):

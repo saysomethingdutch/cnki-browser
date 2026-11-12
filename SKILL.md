@@ -135,28 +135,22 @@ Verified against the institutional interfaces on 2026-11-10.
      tab, not in the article tab. `solve` searches the other tabs and clicks with the
      *owning* page's mouse — clicking through the original page handle silently does
      nothing.
-3. **Slider — one adaptive solver for every variant** (`solve_slider`). CNKI uses at least two
-   slider widgets with unrelated DOM: kns `/verify/home?captchaType=blockPuzzle`
-   (`.verify-sub-block`…) and the **download gate** `bar.cnki.net/bar/verify/…` that appears
-   when clicking PDF download (Tencent `.tencent-captcha-dy__…`). Writing one solver per
-   widget is what broke downloads before (101/101 skipped), so the solver knows no class names:
-   - **parts by structure:** background = largest image-bearing element 200 px+ wide (but not
-     page-sized); piece = image-bearing element inside it, 8–45 % of its width, at the left;
-     handle = small pointer-cursor element below it. Each background candidate is tried in
-     turn until one has a piece and a handle.
-   - **piece shape:** screenshot the background with the piece shown and hidden; the
-     difference is the piece's exact silhouette.
-   - **gap, two cues:** *shade* (ring vs inside contrast of that silhouette, strong on the
-     download gate) and *edge* (silhouette outline vs Canny edges, strong on kns, where decoy
-     outlines exist). Each cue gets a confidence = best / best elsewhere. Drag only when the
-     cues agree (and one is ≥ 1.5) or a single cue is ≥ `CNKI_SLIDER_MIN_CONF` (2.7);
-     otherwise refresh for a new image. Every agreeing case in testing passed.
-   - **closed-loop drag:** move the handle in small steps while reading where the piece
-     actually is, release when it sits on the gap. No assumption about the handle-to-piece
-     ratio, page zoom or device pixel ratio.
-   - **verdict:** page leaves `/verify/` or shows 成功 → pass; 失败/错误 or the piece snapping
-     back → fail, then refresh (some widgets keep the same image after a failure). Up to
-     `CNKI_SLIDER_ATTEMPTS` (6).
+3. **Slider — dispatch by widget type** (`solve_slider`). CNKI has image-gap sliders on
+   kns `/verify/home?captchaType=blockPuzzle` (`.verify-sub-block`…) and the **download gate**
+   `bar.cnki.net/bar/verify/…` (Tencent `.tencent-captcha-dy__…`), plus a simple track slider
+   on the HTML reader `/reader/xml` (`.read-btn-boxXml .slider-wrapper`, `#js-handler`).
+   - **Image-gap variants:** identify the largest visible image-bearing element as the
+     background, then its smaller image-bearing piece and the handle below it. Hide/show the
+     piece to recover its silhouette. Score the gap using shade and edge cues; drag only when
+     the cues agree or one exceeds `CNKI_SLIDER_MIN_CONF` (2.7). The drag follows the piece's
+     actual position, so zoom and device-pixel ratio do not need special handling.
+   - **HTML reader variant:** detect the visible `.read-btn-boxXml .slider-wrapper` only when
+     its prompt asks to continue reading. Drag `#js-handler` to the track's right stop in small
+     steps. No image confidence score applies to this track slider.
+   - **Verdict:** image sliders pass when `/verify/` closes or shows 成功. The reader slider
+     passes only after the gate disappears and `#printContent` grows; otherwise it remains
+     blocked. Image sliders allow up to `CNKI_SLIDER_ATTEMPTS` (6); the reader uses one bounded
+     end-stop drag and checks the result.
    Measured 2026-11-02: **download gate 15/15**, **kns slider 10/10** (most on the first
    image, ~3 s; worst ~10 s), click-word unaffected (6/6).
 4. If both fail: see "skipped, not waited on" below.
@@ -173,6 +167,9 @@ driving the browser): **click-word 15/15**, 11–19 s each, most passing on the 
 image; slider results are under item 3. An earlier click-word version that
 read characters freely and fell back to a vision model was slower (30–110 s) and failed
 most attempts; it was removed.
+
+Live reader-gate check on 2026-11-12: the `/reader/xml` track slider passed once;
+`#printContent` grew from 434 to 1,791 characters, and the previously gated notice text loaded.
 
 **Before testing, make sure nothing else is driving port 9334.** On 2026-11-01 a second
 session ran its own captcha tests on the same Chrome at the same time; the two
